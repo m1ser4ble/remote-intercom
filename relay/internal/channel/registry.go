@@ -26,7 +26,6 @@ type Registry struct {
 type Channel struct {
 	ID             string
 	Name           string
-	Key            string
 	Members        map[string]Member
 	PendingJoins   map[string]JoinRequest
 	CurrentOwnerID string
@@ -73,7 +72,6 @@ func (r *Registry) Connect(channelName, pin, deviceID, deviceName string) Connec
 		ch := &Channel{
 			ID:             channelIDForKey(key),
 			Name:           normalizedName,
-			Key:            key,
 			Members:        map[string]Member{deviceID: member},
 			PendingJoins:   make(map[string]JoinRequest),
 			CurrentOwnerID: deviceID,
@@ -90,6 +88,10 @@ func (r *Registry) Connect(channelName, pin, deviceID, deviceName string) Connec
 		ch.Members[deviceID] = member
 		recomputeOwner(ch)
 		return ConnectResult{Status: StatusConnected, Channel: snapshotChannel(ch), Member: copyMember(member)}
+	}
+
+	if join, ok := pendingJoinForDevice(ch, deviceID); ok {
+		return ConnectResult{Status: StatusPending, Channel: snapshotChannel(ch), JoinRequest: copyJoinRequest(join)}
 	}
 
 	join := JoinRequest{
@@ -115,13 +117,17 @@ func (r *Registry) Approve(channelID, joinRequestID string) error {
 		return fmt.Errorf("join request %q not found", joinRequestID)
 	}
 
+	if _, ok := ch.Members[join.DeviceID]; ok {
+		return fmt.Errorf("device %q is already a member", join.DeviceID)
+	}
+
 	ch.Members[join.DeviceID] = Member{
 		DeviceID:   join.DeviceID,
 		DeviceName: join.DeviceName,
 		Online:     true,
 		Priority:   nextPriority(ch),
 	}
-	delete(ch.PendingJoins, joinRequestID)
+	deletePendingJoinsForDevice(ch, join.DeviceID)
 	recomputeOwner(ch)
 	return nil
 }
@@ -175,8 +181,9 @@ func normalizeChannelName(channelName string) string {
 }
 
 func channelKey(channelName, pin string) string {
-	sum := sha256.Sum256([]byte(channelName + ":" + pin))
-	return hex.EncodeToString(sum[:])
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%d:%s%d:%s", len(channelName), channelName, len(pin), pin)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func channelIDForKey(key string) string {
@@ -187,6 +194,23 @@ func (r *Registry) nextJoinID(channelID, deviceID string) string {
 	r.joinSeq++
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", channelID, deviceID, r.joinSeq)))
 	return "join_" + hex.EncodeToString(sum[:8])
+}
+
+func pendingJoinForDevice(ch *Channel, deviceID string) (JoinRequest, bool) {
+	for _, join := range ch.PendingJoins {
+		if join.DeviceID == deviceID {
+			return join, true
+		}
+	}
+	return JoinRequest{}, false
+}
+
+func deletePendingJoinsForDevice(ch *Channel, deviceID string) {
+	for id, join := range ch.PendingJoins {
+		if join.DeviceID == deviceID {
+			delete(ch.PendingJoins, id)
+		}
+	}
 }
 
 func nextPriority(ch *Channel) int {
@@ -229,7 +253,6 @@ func snapshotChannel(ch *Channel) *Channel {
 	return &Channel{
 		ID:             ch.ID,
 		Name:           ch.Name,
-		Key:            ch.Key,
 		Members:        members,
 		PendingJoins:   pending,
 		CurrentOwnerID: ch.CurrentOwnerID,
