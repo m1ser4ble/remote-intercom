@@ -325,7 +325,7 @@ describe("RelayClient", () => {
 
     client.send("dev_2", "hello");
     client.ask("dev_2", "question?");
-    socket?.emitMessage({ id: "ask_in", type: RelayEventType.MessageSend, from: "dev_2", to: "dev_1", payload: { text: "remote question?", kind: "ask" } });
+    socket?.emitMessage({ id: "ask_in", type: RelayEventType.MessageAsk, from: "dev_2", to: "dev_1", payload: { text: "remote question?", kind: "ask" } });
     client.reply("ask_in", "answer");
     client.approve("join_1");
     client.deny("join_2");
@@ -335,8 +335,8 @@ describe("RelayClient", () => {
     const events = socket?.sent.map((raw) => JSON.parse(raw) as RelayEvent) ?? [];
     expect(events).toEqual([
       expect.objectContaining({ id: "evt_1", type: RelayEventType.MessageSend, channelId: "ch_1", to: "dev_2", payload: { text: "hello", kind: "send" } }),
-      expect.objectContaining({ id: "evt_2", type: RelayEventType.MessageSend, channelId: "ch_1", to: "dev_2", payload: { text: "question?", kind: "ask" } }),
-      expect.objectContaining({ id: "evt_3", type: RelayEventType.MessageSend, channelId: "ch_1", to: "dev_2", replyTo: "ask_in", payload: { text: "answer", kind: "reply" } }),
+      expect.objectContaining({ id: "evt_2", type: RelayEventType.MessageAsk, channelId: "ch_1", to: "dev_2", payload: { text: "question?", kind: "ask" } }),
+      expect.objectContaining({ id: "evt_3", type: RelayEventType.MessageReply, channelId: "ch_1", to: "dev_2", replyTo: "ask_in", payload: { text: "answer", kind: "reply" } }),
       expect.objectContaining({ id: "evt_4", type: RelayEventType.JoinApprove, channelId: "ch_1", payload: { joinRequestId: "join_1" } }),
       expect.objectContaining({ id: "evt_5", type: RelayEventType.JoinDeny, channelId: "ch_1", payload: { joinRequestId: "join_2" } }),
       expect.objectContaining({ id: "evt_6", type: RelayEventType.ListRequest, channelId: "ch_1" }),
@@ -365,6 +365,37 @@ describe("RelayClient", () => {
       expect.objectContaining({ id: "evt_1", type: RelayEventType.JoinApprove, channelId: "ch_1", payload: { joinRequestId: "join_alias_1" } }),
       expect.objectContaining({ id: "evt_2", type: RelayEventType.JoinDeny, channelId: "ch_1", payload: { joinRequestId: "join_alias_2" } }),
     ]);
+  });
+
+  it("reconnects an established member socket after close", async () => {
+    vi.useFakeTimers();
+    let connectCount = 0;
+    const fetchImpl = vi.fn<FetchLike>(async () => {
+      connectCount += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => connectPayload({ token: `token_${connectCount}` }),
+      };
+    });
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: fetchImpl, WebSocket: MockWebSocket, reconnectDelayMs: 5 },
+    );
+
+    try {
+      await connectAndOpen(client);
+      MockWebSocket.instances[0]?.close();
+      await vi.advanceTimersByTimeAsync(5);
+      await flushPromises();
+
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(MockWebSocket.instances).toHaveLength(2);
+      expect(MockWebSocket.instances[1]?.url).toBe("ws://relay.example/ws?token=token_2");
+      expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body))).toEqual(expect.objectContaining({ deviceId: "dev_1" }));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("throws useful errors for non-2xx JSON responses", async () => {

@@ -20,6 +20,8 @@ export interface ConnectResponse {
 export const RelayEventType = {
   Error: "error",
   MessageSend: "message.send",
+  MessageAsk: "message.ask",
+  MessageReply: "message.reply",
   MessageBroadcast: "message.broadcast",
   JoinRequest: "join.request",
   JoinApprove: "join.approve",

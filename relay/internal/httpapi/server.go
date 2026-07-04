@@ -165,6 +165,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := s.Registry.Connect(request.ChannelName, request.PIN, request.DeviceID, request.DeviceName)
+	if result.Err != nil {
+		if errors.Is(result.Err, channel.ErrLimitExceeded) {
+			writeError(w, http.StatusTooManyRequests, result.Err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "channel connect failed")
+		return
+	}
 	if result.Channel == nil {
 		writeError(w, http.StatusInternalServerError, "channel connect failed")
 		return

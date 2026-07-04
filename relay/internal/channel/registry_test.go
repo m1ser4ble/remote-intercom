@@ -1,6 +1,9 @@
 package channel
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestFirstConnectCreatesOfflineChannelMember(t *testing.T) {
 	r := NewRegistry()
@@ -42,6 +45,46 @@ func TestApproveJoinAddsOfflineMember(t *testing.T) {
 	}
 	if member.Online {
 		t.Fatal("approved member should remain offline until websocket connects")
+	}
+}
+
+func TestConnectRejectsWhenPendingLimitReached(t *testing.T) {
+	r := NewRegistry()
+	r.SetLimits(32, 1)
+	r.Connect("dwkim", "1234", "dev_a", "macbook")
+	first := r.Connect("dwkim", "1234", "dev_b", "mini")
+	if first.Err != nil || first.Status != StatusPending {
+		t.Fatalf("first pending = status %s err %v", first.Status, first.Err)
+	}
+	second := r.Connect("dwkim", "1234", "dev_c", "phone")
+	if second.Err == nil {
+		t.Fatal("expected pending limit error")
+	}
+	if !errors.Is(second.Err, ErrLimitExceeded) {
+		t.Fatalf("err = %v, want ErrLimitExceeded", second.Err)
+	}
+	if got := len(r.Channel(first.Channel.ID).PendingJoins); got != 1 {
+		t.Fatalf("pending joins = %d, want 1", got)
+	}
+}
+
+func TestConnectRejectsWhenMemberLimitReached(t *testing.T) {
+	r := NewRegistry()
+	r.SetLimits(1, 16)
+	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	if created.Err != nil {
+		t.Fatal(created.Err)
+	}
+	reconnected := r.Connect("dwkim", "1234", "dev_a", "macbook-renamed")
+	if reconnected.Err != nil || reconnected.Status != StatusConnected {
+		t.Fatalf("reconnect = status %s err %v", reconnected.Status, reconnected.Err)
+	}
+	pending := r.Connect("dwkim", "1234", "dev_b", "mini")
+	if pending.Err == nil {
+		t.Fatal("expected member limit error")
+	}
+	if !errors.Is(pending.Err, ErrLimitExceeded) {
+		t.Fatalf("err = %v, want ErrLimitExceeded", pending.Err)
 	}
 }
 

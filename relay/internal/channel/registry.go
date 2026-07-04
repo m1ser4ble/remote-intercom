@@ -15,15 +15,23 @@ const (
 	StatusCreated   Status = "created"
 	StatusPending   Status = "pending_approval"
 	StatusConnected Status = "connected"
+
+	DefaultMaxMembers      = 32
+	DefaultMaxPendingJoins = 16
 )
 
-var ErrNotCurrentOwner = errors.New("only the current owner can decide join requests")
+var (
+	ErrNotCurrentOwner = errors.New("only the current owner can decide join requests")
+	ErrLimitExceeded   = errors.New("channel limit exceeded")
+)
 
 type Registry struct {
-	mu           sync.RWMutex
-	channels     map[string]*Channel
-	channelByKey map[string]string
-	joinSeq      uint64
+	mu              sync.RWMutex
+	channels        map[string]*Channel
+	channelByKey    map[string]string
+	joinSeq         uint64
+	maxMembers      int
+	maxPendingJoins int
 }
 
 type Channel struct {
@@ -54,6 +62,7 @@ type ConnectResult struct {
 	Channel     *Channel
 	Member      *Member
 	JoinRequest *JoinRequest
+	Err         error
 }
 
 type PresenceChange struct {
@@ -66,8 +75,22 @@ type PresenceChange struct {
 
 func NewRegistry() *Registry {
 	return &Registry{
-		channels:     make(map[string]*Channel),
-		channelByKey: make(map[string]string),
+		channels:        make(map[string]*Channel),
+		channelByKey:    make(map[string]string),
+		maxMembers:      DefaultMaxMembers,
+		maxPendingJoins: DefaultMaxPendingJoins,
+	}
+}
+
+// SetLimits configures registry resource limits. It is primarily intended for tests.
+func (r *Registry) SetLimits(maxMembers, maxPendingJoins int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if maxMembers > 0 {
+		r.maxMembers = maxMembers
+	}
+	if maxPendingJoins > 0 {
+		r.maxPendingJoins = maxPendingJoins
 	}
 }
 
@@ -104,6 +127,12 @@ func (r *Registry) Connect(channelName, pin, deviceID, deviceName string) Connec
 	if join, ok := pendingJoinForDevice(ch, deviceID); ok {
 		return ConnectResult{Status: StatusPending, Channel: snapshotChannel(ch), JoinRequest: copyJoinRequest(join)}
 	}
+	if len(ch.Members) >= r.maxMembers {
+		return ConnectResult{Status: StatusPending, Channel: snapshotChannel(ch), Err: fmt.Errorf("%w: max members reached", ErrLimitExceeded)}
+	}
+	if len(ch.PendingJoins) >= r.maxPendingJoins {
+		return ConnectResult{Status: StatusPending, Channel: snapshotChannel(ch), Err: fmt.Errorf("%w: max pending joins reached", ErrLimitExceeded)}
+	}
 
 	join := JoinRequest{
 		ID:         r.nextJoinID(ch.ID, deviceID),
@@ -123,7 +152,7 @@ func (r *Registry) Approve(channelID, joinRequestID string) error {
 	if !ok {
 		return fmt.Errorf("channel %q not found", channelID)
 	}
-	return approveLocked(ch, joinRequestID)
+	return approveLocked(ch, joinRequestID, r.maxMembers)
 }
 
 func (r *Registry) ApproveByOwner(channelID, ownerDeviceID, joinRequestID string) error {
@@ -137,7 +166,7 @@ func (r *Registry) ApproveByOwner(channelID, ownerDeviceID, joinRequestID string
 	if ch.CurrentOwnerID != ownerDeviceID {
 		return ErrNotCurrentOwner
 	}
-	return approveLocked(ch, joinRequestID)
+	return approveLocked(ch, joinRequestID, r.maxMembers)
 }
 
 func (r *Registry) Deny(channelID, joinRequestID string) error {
@@ -262,12 +291,15 @@ func (r *Registry) nextJoinID(channelID, deviceID string) string {
 	return "join_" + hex.EncodeToString(sum[:8])
 }
 
-func approveLocked(ch *Channel, joinRequestID string) error {
+func approveLocked(ch *Channel, joinRequestID string, maxMembers int) error {
 	join, ok := ch.PendingJoins[joinRequestID]
 	if !ok {
 		return fmt.Errorf("join request %q not found", joinRequestID)
 	}
 
+	if len(ch.Members) >= maxMembers {
+		return fmt.Errorf("%w: max members reached", ErrLimitExceeded)
+	}
 	if _, ok := ch.Members[join.DeviceID]; ok {
 		return fmt.Errorf("device %q is already a member", join.DeviceID)
 	}

@@ -82,6 +82,8 @@ Errors use JSON:
 {"error":"channelName, pin, and deviceName are required"}
 ```
 
+Default resource limits are 32 admitted members and 16 pending joins per channel.
+
 ## WebSocket
 
 Connect to `wsUrl` with either:
@@ -89,7 +91,7 @@ Connect to `wsUrl` with either:
 - `Authorization: Bearer <token>`
 - `?token=<token>` query parameter
 
-All frames are UTF-8 JSON text:
+All frames are UTF-8 JSON text. Frames larger than 64 KiB are rejected.
 
 ```json
 {
@@ -120,21 +122,27 @@ Direct message to one online device.
 }
 ```
 
-Ask/reply use the same event type with payload markers:
+### `message.ask`
+
+Question/request to one online device. Payload markers such as `kind` are optional compatibility metadata; the event type is first-class.
 
 ```json
 {
   "id": "evt_102",
-  "type": "message.send",
+  "type": "message.ask",
   "to": "dev_bob",
   "payload": {"text":"approve deploy?","kind":"ask"}
 }
 ```
 
+### `message.reply`
+
+Reply to an earlier event. The relay routes it like a direct message and preserves `replyTo`.
+
 ```json
 {
   "id": "evt_103",
-  "type": "message.send",
+  "type": "message.reply",
   "to": "dev_alice",
   "replyTo": "evt_102",
   "payload": {"text":"approved","kind":"reply"}

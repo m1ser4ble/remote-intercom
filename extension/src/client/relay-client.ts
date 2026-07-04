@@ -51,6 +51,7 @@ export interface RelayClientDependencies {
   fetch?: FetchLike;
   WebSocket?: WebSocketConstructorLike;
   idGenerator?: IdGenerator;
+  reconnectDelayMs?: number;
 }
 
 export interface ConnectOptions {
@@ -86,11 +87,17 @@ export class RelayClient {
   private readonly fetchImpl: FetchLike;
   private readonly WebSocketImpl: WebSocketConstructorLike;
   private readonly idGenerator: IdGenerator;
+  private readonly reconnectDelayMs: number;
   private readonly handlers = new Map<string, Set<RelayEventHandler>>();
   private readonly replyTargets = new Map<string, string>();
+  private readonly suppressReconnectForSocket = new WeakSet<WebSocketLike>();
   private socket?: WebSocketLike;
   private socketCleanup?: () => void;
   private pendingOpenReject?: (error: RelayClientError) => void;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private reconnectAttempt = 0;
+  private explicitDisconnect = false;
+  private lastConnectArgs?: { channel: string; pin: string; options: ConnectOptions };
   private state: RelayClientState = {};
 
   constructor(config: RelayClientConfig = {}, dependencies: RelayClientDependencies = {}) {
@@ -98,6 +105,7 @@ export class RelayClient {
     this.fetchImpl = dependencies.fetch ?? defaultFetch;
     this.WebSocketImpl = dependencies.WebSocket ?? (DefaultWebSocket as unknown as WebSocketConstructorLike);
     this.idGenerator = dependencies.idGenerator ?? defaultIdGenerator;
+    this.reconnectDelayMs = dependencies.reconnectDelayMs ?? 250;
   }
 
   get token(): string | undefined {
@@ -125,6 +133,9 @@ export class RelayClient {
   }
 
   async connect(channel: string, pin: string, options: ConnectOptions = {}): Promise<ConnectResponse> {
+    this.explicitDisconnect = false;
+    this.clearReconnectTimer();
+    this.lastConnectArgs = { channel, pin, options: { ...options } };
     const request: ConnectRequest = {
       channelName: channel,
       pin,
@@ -164,7 +175,11 @@ export class RelayClient {
       wsUrl: connectResponse.wsUrl,
     };
 
+    if (this.lastConnectArgs?.channel === channel && this.lastConnectArgs.pin === pin) {
+      this.lastConnectArgs.options.deviceId = connectResponse.deviceId;
+    }
     await this.openSocket(connectResponse.wsUrl || this.config.relayWsUrl, connectResponse.token);
+    this.reconnectAttempt = 0;
     return connectResponse;
   }
 
@@ -211,7 +226,7 @@ export class RelayClient {
 
   ask(to: string, message: string): RelayEvent<MessagePayload> {
     return this.sendEvent({
-      type: RelayEventType.MessageSend,
+      type: RelayEventType.MessageAsk,
       to,
       payload: { text: message, kind: "ask" },
     }) as RelayEvent<MessagePayload>;
@@ -223,7 +238,7 @@ export class RelayClient {
       throw new RelayClientError(`no reply target recorded for ${replyTo}`);
     }
     return this.sendEvent({
-      type: RelayEventType.MessageSend,
+      type: RelayEventType.MessageReply,
       to,
       replyTo,
       payload: { text: message, kind: "reply" },
@@ -261,21 +276,13 @@ export class RelayClient {
   }
 
   disconnect(code?: number, reason?: string): void {
-    const socket = this.socket;
-    const rejectPendingOpen = this.pendingOpenReject;
-    if (rejectPendingOpen !== undefined) {
-      rejectPendingOpen(new RelayClientError("relay WebSocket connection was cancelled"));
-    } else {
-      const cleanup = this.socketCleanup;
-      this.socket = undefined;
-      this.socketCleanup = undefined;
-      cleanup?.();
-    }
-    socket?.close?.(code, reason);
+    this.explicitDisconnect = true;
+    this.clearReconnectTimer();
+    this.closeCurrentSocket(code, reason, true);
   }
 
   private openSocket(wsUrl: string, token: string): Promise<void> {
-    this.disconnect();
+    this.closeCurrentSocket(undefined, undefined, true);
     const socket = new this.WebSocketImpl(socketURLWithToken(wsUrl, token));
     this.socket = socket;
 
@@ -336,6 +343,9 @@ export class RelayClient {
         }
         this.socket = undefined;
         cleanup();
+        if (!this.explicitDisconnect && !this.suppressReconnectForSocket.has(socket) && this.isEstablishedMemberConnection()) {
+          this.scheduleReconnect();
+        }
       };
       const errorHandler = (first: unknown): void => {
         if (!isCurrentSocket()) {
@@ -360,6 +370,61 @@ export class RelayClient {
         openHandler();
       }
     });
+  }
+
+  private closeCurrentSocket(code?: number, reason?: string, suppressReconnect = false): void {
+    const socket = this.socket;
+    if (socket !== undefined && suppressReconnect) {
+      this.suppressReconnectForSocket.add(socket);
+    }
+    const rejectPendingOpen = this.pendingOpenReject;
+    if (rejectPendingOpen !== undefined) {
+      rejectPendingOpen(new RelayClientError("relay WebSocket connection was cancelled"));
+    } else {
+      const cleanup = this.socketCleanup;
+      this.socket = undefined;
+      this.socketCleanup = undefined;
+      cleanup?.();
+    }
+    socket?.close?.(code, reason);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== undefined) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer !== undefined || this.lastConnectArgs === undefined) {
+      return;
+    }
+    const delay = Math.min(this.reconnectDelayMs * (2 ** this.reconnectAttempt), 5_000);
+    this.reconnectAttempt += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.reconnect();
+    }, delay);
+  }
+
+  private async reconnect(): Promise<void> {
+    const args = this.lastConnectArgs;
+    if (this.explicitDisconnect || args === undefined) {
+      return;
+    }
+    try {
+      await this.connect(args.channel, args.pin, args.options);
+    } catch (error) {
+      if (!this.explicitDisconnect) {
+        this.emitError("reconnect_failed", error);
+        this.scheduleReconnect();
+      }
+    }
+  }
+
+  private isEstablishedMemberConnection(): boolean {
+    return this.state.status === "created" || this.state.status === "connected";
   }
 
   private handleSocketMessage(rawData: unknown): void {

@@ -101,23 +101,23 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 		},
 	})
 	message := readUntil(t, bobWS, "message.send", func(event protocol.Event) bool { return event.ID == "send-1" })
-	assertMessage(t, message, alice.ChannelID, "dev_alice", "dev_bob", "send", "hello bob", "")
+	assertMessage(t, message, "message.send", alice.ChannelID, "dev_alice", "dev_bob", "send", "hello bob", "")
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "ask-1",
-		Type: "message.send",
+		Type: "message.ask",
 		To:   "dev_bob",
 		Payload: map[string]any{
 			"kind": "ask",
 			"text": "approve deploy?",
 		},
 	})
-	ask := readUntil(t, bobWS, "message.send", func(event protocol.Event) bool { return event.ID == "ask-1" })
-	assertMessage(t, ask, alice.ChannelID, "dev_alice", "dev_bob", "ask", "approve deploy?", "")
+	ask := readUntil(t, bobWS, "message.ask", func(event protocol.Event) bool { return event.ID == "ask-1" })
+	assertMessage(t, ask, "message.ask", alice.ChannelID, "dev_alice", "dev_bob", "ask", "approve deploy?", "")
 
 	writeEvent(t, bobWS, protocol.Event{
 		ID:      "reply-1",
-		Type:    "message.send",
+		Type:    "message.reply",
 		To:      "dev_alice",
 		ReplyTo: "ask-1",
 		Payload: map[string]any{
@@ -125,8 +125,8 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 			"text": "approved",
 		},
 	})
-	reply := readUntil(t, aliceWS, "message.send", func(event protocol.Event) bool { return event.ID == "reply-1" }, "presence.changed", "owner.changed")
-	assertMessage(t, reply, alice.ChannelID, "dev_bob", "dev_alice", "reply", "approved", "ask-1")
+	reply := readUntil(t, aliceWS, "message.reply", func(event protocol.Event) bool { return event.ID == "reply-1" }, "presence.changed", "owner.changed")
+	assertMessage(t, reply, "message.reply", alice.ChannelID, "dev_bob", "dev_alice", "reply", "approved", "ask-1")
 
 	if err := aliceWS.Close(websocket.StatusNormalClosure, "e2e disconnect alice"); err != nil {
 		t.Fatalf("close alice websocket: %v", err)
@@ -322,10 +322,10 @@ func assertStatusResponse(t *testing.T, event protocol.Event, channelID, deviceI
 	}
 }
 
-func assertMessage(t *testing.T, event protocol.Event, channelID, from, to, kind, text, replyTo string) {
+func assertMessage(t *testing.T, event protocol.Event, eventType, channelID, from, to, kind, text, replyTo string) {
 	t.Helper()
-	if event.Type != "message.send" {
-		t.Fatalf("event type = %q, want message.send", event.Type)
+	if event.Type != eventType {
+		t.Fatalf("event type = %q, want %s", event.Type, eventType)
 	}
 	if event.ChannelID != channelID {
 		t.Fatalf("message channel id = %q, want %q", event.ChannelID, channelID)

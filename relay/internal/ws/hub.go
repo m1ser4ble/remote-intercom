@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	writeTimeout          = 5 * time.Second
-	heartbeatEvery        = 30 * time.Second
-	heartbeatTimeout      = 5 * time.Second
-	defaultReconnectGrace = 30 * time.Second
+	writeTimeout           = 5 * time.Second
+	heartbeatEvery         = 25 * time.Second
+	heartbeatTimeout       = 75 * time.Second // pong wait timeout for the 25s heartbeat interval.
+	defaultReconnectGrace  = 30 * time.Second
+	DefaultMaxMessageBytes = 64 * 1024
 )
 
 // Hub manages live WebSocket connections and routes relay protocol events.
@@ -79,6 +80,7 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(DefaultMaxMessageBytes)
 
 	client := &connection{
 		hub:           h,
@@ -123,6 +125,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if messageType != websocket.MessageText {
 			client.sendError("invalid_event", "only text JSON frames are supported", "")
+			continue
+		}
+		if len(data) > DefaultMaxMessageBytes {
+			client.sendError("invalid_event", "message exceeds maximum size", "")
 			continue
 		}
 
@@ -187,7 +193,7 @@ func (h *Hub) handleEvent(c *connection, event protocol.Event) {
 	}
 
 	switch event.Type {
-	case "message.send":
+	case "message.send", "message.ask", "message.reply":
 		h.handleMessageSend(c, event)
 	case "message.broadcast":
 		h.handleMessageBroadcast(c, event)
@@ -210,7 +216,7 @@ func (h *Hub) handleMessageSend(c *connection, event protocol.Event) {
 		return
 	}
 	if strings.TrimSpace(event.To) == "" {
-		c.sendError("invalid_event", "message.send requires a target", event.ID)
+		c.sendError("invalid_event", event.Type+" requires a target", event.ID)
 		return
 	}
 

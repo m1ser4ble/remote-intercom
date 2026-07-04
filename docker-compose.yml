@@ -7,5 +7,7 @@ services:
     command: ["go", "run", "./cmd/relay"]
     environment:
       RELAY_ADDR: ":8080"
+      # Example development secret; override in production.
+      RELAY_TOKEN_SECRET: "change-me-change-me-change-me-change-me"
     ports:
       - "8080:8080"

@@ -99,6 +99,33 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	}
 
 	writeEvent(t, aliceWS, protocol.Event{
+		ID:   "ask-1",
+		Type: "message.ask",
+		To:   "dev_bob",
+		Payload: map[string]any{
+			"text": "approve deploy?",
+		},
+	})
+	ask := readEvent(t, bobWS)
+	if ask.Type != "message.ask" || ask.From != "dev_alice" || ask.To != "dev_bob" {
+		t.Fatalf("ask route = type %s %s -> %s, want message.ask dev_alice -> dev_bob", ask.Type, ask.From, ask.To)
+	}
+
+	writeEvent(t, bobWS, protocol.Event{
+		ID:      "reply-1",
+		Type:    "message.reply",
+		To:      "dev_alice",
+		ReplyTo: "ask-1",
+		Payload: map[string]any{
+			"text": "approved",
+		},
+	})
+	reply := readEventOfType(t, aliceWS, "message.reply", func(event protocol.Event) bool { return event.ID == "reply-1" })
+	if reply.From != "dev_bob" || reply.To != "dev_alice" || reply.ReplyTo != "ask-1" {
+		t.Fatalf("reply route = %s -> %s replyTo %s, want dev_bob -> dev_alice replyTo ask-1", reply.From, reply.To, reply.ReplyTo)
+	}
+
+	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "broadcast-1",
 		Type: "message.broadcast",
 		Payload: map[string]any{
@@ -127,7 +154,7 @@ func TestPendingConnectionCannotRouteMessages(t *testing.T) {
 	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
 	_ = readEventOfType(t, aliceWS, "join.request", nil)
 
-	writeEvent(t, bobWS, protocol.Event{ID: "send-pending", Type: "message.send", To: "dev_alice"})
+	writeEvent(t, bobWS, protocol.Event{ID: "send-pending", Type: "message.ask", To: "dev_alice"})
 
 	errorEvent := readEvent(t, bobWS)
 	if errorEvent.Type != "error" {
@@ -136,6 +163,19 @@ func TestPendingConnectionCannotRouteMessages(t *testing.T) {
 	if got := stringPayload(t, errorEvent.Payload, "code"); got != "unauthorized" {
 		t.Fatalf("error code = %q, want unauthorized", got)
 	}
+}
+
+func TestOversizedWebSocketMessageIsRejected(t *testing.T) {
+	server := newRelayFixture(t, 50*time.Millisecond).server
+	alice := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := aliceWS.Write(ctx, websocket.MessageText, bytes.Repeat([]byte("a"), 64*1024+1)); err != nil {
+		t.Fatal(err)
+	}
+	assertCloseStatus(t, aliceWS, websocket.StatusMessageTooBig)
 }
 
 func TestDeniedPendingConnectionReceivesDeniedThenCloses(t *testing.T) {

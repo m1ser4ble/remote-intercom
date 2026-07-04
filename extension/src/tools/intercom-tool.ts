@@ -182,9 +182,9 @@ export function registerRemoteIntercom(registrar: ToolRegistrar, options: Create
 }
 
 function installRelayEventHandlers(context: ToolContext): () => void {
-  const disposeMessageHandler = context.client.on(RelayEventType.MessageSend, (event) => {
+  const askHandler = (event: RelayEvent): void => {
     const payload = event.payload as MessagePayload | undefined;
-    if (payload?.kind !== "ask" || event.id === undefined || typeof payload.text !== "string") {
+    if ((event.type !== RelayEventType.MessageAsk && payload?.kind !== "ask") || event.id === undefined || typeof payload?.text !== "string") {
       return;
     }
     context.pending.addAsk({
@@ -196,7 +196,9 @@ function installRelayEventHandlers(context: ToolContext): () => void {
       receivedAt: new Date().toISOString(),
     });
     notify(context, `Device ${event.from ?? "unknown"} asks: ${payload.text}`, event);
-  });
+  };
+  const disposeMessageHandler = context.client.on(RelayEventType.MessageSend, askHandler);
+  const disposeAskHandler = context.client.on(RelayEventType.MessageAsk, askHandler);
 
   const disposeJoinHandler = context.client.on(RelayEventType.JoinRequest, (event) => {
     const payload = event.payload;
@@ -226,6 +228,7 @@ function installRelayEventHandlers(context: ToolContext): () => void {
 
   return () => {
     disposeMessageHandler();
+    disposeAskHandler();
     disposeJoinHandler();
   };
 }

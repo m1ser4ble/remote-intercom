@@ -79,6 +79,25 @@ func TestConnectSecondDeviceReturnsPendingApproval(t *testing.T) {
 	}
 }
 
+func TestConnectLimitReturnsJSONError(t *testing.T) {
+	server := newTestServer(t)
+	server.Registry.SetLimits(1, 16)
+	handler := server.Routes()
+
+	_ = postConnect(t, handler, protocol.ConnectRequest{
+		ChannelName: "ops",
+		PIN:         "123456",
+		DeviceName:  "alice-laptop",
+		DeviceID:    "dev_alice",
+	})
+	rec := postRawConnect(t, handler, `{"channelName":"ops","pin":"123456","deviceName":"bob-laptop","deviceId":"dev_bob"}`)
+
+	assertJSONError(t, rec, http.StatusTooManyRequests)
+	if !strings.Contains(rec.Body.String(), "channel limit exceeded") {
+		t.Fatalf("limit error did not include registry error: %s", rec.Body.String())
+	}
+}
+
 func TestInstallScriptUsesForwardedProtoAndHost(t *testing.T) {
 	t.Setenv("RELAY_INSTALL_TEMPLATE", "")
 	handler := newTestServer(t).Routes()

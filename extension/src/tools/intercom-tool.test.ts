@@ -45,11 +45,11 @@ class MockClient implements RemoteIntercomClient {
   }
 
   ask(to: string, message: string): RelayEvent<MessagePayload> {
-    return this.record({ id: "evt_ask", type: RelayEventType.MessageSend, to, payload: { text: message, kind: "ask" } });
+    return this.record({ id: "evt_ask", type: RelayEventType.MessageAsk, to, payload: { text: message, kind: "ask" } });
   }
 
   reply(replyTo: string, message: string): RelayEvent<MessagePayload> {
-    return this.record({ id: "evt_reply", type: RelayEventType.MessageSend, replyTo, payload: { text: message, kind: "reply" } });
+    return this.record({ id: "evt_reply", type: RelayEventType.MessageReply, replyTo, payload: { text: message, kind: "reply" } });
   }
 
   status(): RelayEvent {
@@ -240,7 +240,7 @@ describe("remote intercom tool", () => {
 
     client.emit({
       id: "ask_1",
-      type: RelayEventType.MessageSend,
+      type: RelayEventType.MessageAsk,
       from: "dev_2",
       to: "dev_self",
       payload: { text: "ready?", kind: "ask" },
@@ -291,7 +291,7 @@ describe("remote intercom tool", () => {
 
     client.emit({
       id: "ask_1",
-      type: RelayEventType.MessageSend,
+      type: RelayEventType.MessageAsk,
       from: "dev_2",
       to: "dev_self",
       payload: { text: "ready?", kind: "ask" },
@@ -302,6 +302,6 @@ describe("remote intercom tool", () => {
 
     await tool.execute({ action: "reply", replyTo: "ask_1", message: "yes" });
     expect(pending.getAsk("ask_1")).toBeUndefined();
-    expect(client.sent).toContainEqual(expect.objectContaining({ type: RelayEventType.MessageSend, replyTo: "ask_1", payload: { text: "yes", kind: "reply" } }));
+    expect(client.sent).toContainEqual(expect.objectContaining({ type: RelayEventType.MessageReply, replyTo: "ask_1", payload: { text: "yes", kind: "reply" } }));
   });
 });
