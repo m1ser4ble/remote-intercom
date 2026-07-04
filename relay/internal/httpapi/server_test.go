@@ -95,6 +95,15 @@ func TestInstallScriptUsesForwardedProtoAndHost(t *testing.T) {
 	if !strings.Contains(body, `RELAY_WS_URL='wss://my-relay.example.com/ws'`) {
 		t.Fatalf("install script missing wss relay url: %s", body)
 	}
+	if !strings.Contains(body, `"relayHttpUrl": "https://my-relay.example.com"`) {
+		t.Fatalf("install script missing config http relay url: %s", body)
+	}
+	if !strings.Contains(body, `"relayWsUrl": "wss://my-relay.example.com/ws"`) {
+		t.Fatalf("install script missing config ws relay url: %s", body)
+	}
+	if !strings.Contains(body, `.pi/remote-intercom/config.json`) {
+		t.Fatalf("install script missing pi config path: %s", body)
+	}
 }
 
 func TestInstallScriptUsesConfiguredPublicURLs(t *testing.T) {
