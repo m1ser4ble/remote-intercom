@@ -117,6 +117,17 @@ func TestRejectsTokenSignedWithWrongSecret(t *testing.T) {
 	}
 }
 
+func TestRejectsTokenSignedWithNonHS256Method(t *testing.T) {
+	mgr := newTestTokenManager(t)
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS384, validClaims()).SignedString(testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Verify(token); err == nil {
+		t.Fatal("expected non-HS256 signing method error")
+	}
+}
+
 func TestRejectsTokenMissingExpiration(t *testing.T) {
 	mgr := newTestTokenManager(t)
 	token := signClaims(t, testSecret, Claims{
