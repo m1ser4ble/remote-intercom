@@ -39,11 +39,23 @@ Request:
 }
 ```
 
-Response for the first device or a returning member:
+Response for the first device:
 
 ```json
 {
   "status": "created",
+  "channelId": "ch_...",
+  "deviceId": "dev_alice",
+  "token": "eyJ...",
+  "wsUrl": "wss://relay.example.com/ws"
+}
+```
+
+Response for a returning admitted member:
+
+```json
+{
+  "status": "connected",
   "channelId": "ch_...",
   "deviceId": "dev_alice",
   "token": "eyJ...",
