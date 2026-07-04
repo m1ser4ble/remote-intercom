@@ -1,12 +1,16 @@
 # Remote Intercom
 
-Remote Intercom is a self-hostable relay for pi intercom sessions. It includes:
+Remote Intercom is a self-hostable channel relay for pi sessions that cannot reach each other through local IPC or SSH.
+
+The concept is: open the same human-friendly channel from two machines, such as `dwkim 1234`, and let the relay connect those pi sessions with an intercom-like tool surface. Users should not need to copy long tokens, manage SSH access, or use a separate admin panel. The pi agent conversation is the primary interface.
+
+It includes:
 
 - a Go relay that serves HTTP bootstrap endpoints and WebSocket session traffic;
 - a TypeScript pi extension/client;
 - a relay-rendered installer script for local configuration.
 
-Channels are ephemeral in-memory rooms keyed by channel name + PIN. The first device becomes owner; later devices require owner approval.
+Channels are ephemeral live rooms keyed by channel name + PIN. The first device becomes owner; later devices require owner approval. Owner is a live role, not a permanent account: if the owner disconnects, ownership fails over to the next online member, and returns when the higher-priority member reconnects while the channel still exists.
 
 ## Quick start
 
@@ -39,7 +43,9 @@ pi extension <--HTTP /channels/connect-- relay
 pi extension <--WebSocket /ws----------> relay <--WebSocket /ws--> pi extension
 ```
 
-HTTP is used for health, version, installer rendering, and token bootstrap. WebSocket is used for presence, join approval, member lists, status, and intercom messages.
+HTTP is used for health, version, installer rendering, and token bootstrap. WebSocket is used for live presence, owner changes, join approval, member lists, status, and intercom messages.
+
+The relay is intentionally narrow: it routes messages, tracks ephemeral channel state, and enforces owner approval. It does not expose a server-side admin/control API for manipulating rooms. Channel decisions are made through the owner pi agent flow.
 
 ## Development commands
 
@@ -58,6 +64,7 @@ npm run build
 
 ## Documentation
 
+- [Concept and design direction](docs/concept.md)
 - [Wire protocol](protocol/wire.md)
 - [Self-hosting](docs/self-hosting.md)
 - [Security model](docs/security.md)
