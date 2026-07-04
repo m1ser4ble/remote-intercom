@@ -49,7 +49,12 @@ less remote-intercom-install.sh
 sh remote-intercom-install.sh
 ```
 
-The installer uses `set -eu`, quotes substituted relay URLs, and writes only `~/.pi/remote-intercom/config.json` unless `PI_REMOTE_INTERCOM_CONFIG_DIR` is set.
+The installer uses `set -eu`, quotes substituted relay URLs, downloads the bundled extension from the same relay, and writes only:
+
+- `~/.pi/remote-intercom/config.json` unless `PI_REMOTE_INTERCOM_CONFIG_DIR` is set;
+- `~/.pi/agent/extensions/remote-intercom/index.js` unless `PI_REMOTE_INTERCOM_EXTENSION_DIR` is set.
+
+The relay serves the extension bundle from `RELAY_EXTENSION_BUNDLE`; operators should build and review that bundle before exposing `/install.sh`.
 
 ## Rate limits and abuse controls
 

@@ -16,14 +16,21 @@ Returns `200 OK` with `ok\n` when the relay process is alive.
 
 ### `GET /install.sh`
 
-Returns a shell installer/configuration script. The relay infers public URLs from `Host` and `X-Forwarded-Proto` unless configured with public URLs by the embedding server.
+Returns a shell installer script. The relay infers public URLs from `Host` and `X-Forwarded-Proto` unless configured with public URLs by the embedding server.
 
 The rendered script contains:
 
 ```sh
 RELAY_HTTP_URL='https://relay.example.com'
 RELAY_WS_URL='wss://relay.example.com/ws'
+EXTENSION_URL='https://relay.example.com/extension.mjs'
 ```
+
+The script writes relay configuration and installs the bundled pi extension into the pi extension discovery directory.
+
+### `GET /extension.mjs`
+
+Returns the bundled single-file pi extension served from the relay operator's `RELAY_EXTENSION_BUNDLE` path. If no bundle is configured, the endpoint returns `404` JSON error.
 
 ### `POST /channels/connect`
 

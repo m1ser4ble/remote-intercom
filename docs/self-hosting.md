@@ -5,14 +5,23 @@ Remote Intercom is designed to run behind your own HTTPS reverse proxy. The curr
 ## Run locally
 
 ```bash
-cd relay
-RELAY_TOKEN_SECRET="$(openssl rand -hex 32)" go run ./cmd/relay
+cd extension
+npm ci
+npm run build:bundle
+
+cd ../relay
+RELAY_TOKEN_SECRET="$(openssl rand -hex 32)" \
+RELAY_EXTENSION_BUNDLE="$(pwd)/../extension/dist/remote-intercom-extension.mjs" \
+go run ./cmd/relay
 ```
 
 The relay listens on `:8080` by default. Override with `RELAY_ADDR`:
 
 ```bash
-RELAY_ADDR=":9090" RELAY_TOKEN_SECRET="$(openssl rand -hex 32)" go run ./cmd/relay
+RELAY_ADDR=":9090" \
+RELAY_TOKEN_SECRET="$(openssl rand -hex 32)" \
+RELAY_EXTENSION_BUNDLE="$(pwd)/../extension/dist/remote-intercom-extension.mjs" \
+go run ./cmd/relay
 ```
 
 ## Docker run
@@ -24,9 +33,11 @@ docker run --rm \
   -p 8080:8080 \
   -e RELAY_ADDR=":8080" \
   -e RELAY_TOKEN_SECRET="$(openssl rand -hex 32)" \
+  -e RELAY_EXTENSION_BUNDLE="/bundle/remote-intercom-extension.mjs" \
   -v "$PWD/relay:/app" \
+  -v "$PWD/extension/dist/remote-intercom-extension.mjs:/bundle/remote-intercom-extension.mjs:ro" \
   -w /app \
-  golang:1.23 \
+  golang:1.26 \
   go run ./cmd/relay
 ```
 
@@ -40,6 +51,7 @@ docker compose up relay
 
 - `RELAY_TOKEN_SECRET`: HMAC secret for member and pending JWTs. Use a long random value and keep it stable across relay restarts if clients may reconnect with existing tokens.
 - `RELAY_ADDR`: listen address, default `:8080`.
+- `RELAY_EXTENSION_BUNDLE`: path to the bundled pi extension served at `/extension.mjs`. Set this for one-line installer support.
 
 If `RELAY_TOKEN_SECRET` is omitted, the relay generates a development-only secret on startup. Do not rely on that in shared deployments.
 
@@ -87,15 +99,12 @@ less remote-intercom-install.sh
 sh remote-intercom-install.sh
 ```
 
-The MVP installer writes `~/.pi/remote-intercom/config.json` with the relay HTTP and WebSocket URLs. It does not install a published extension package yet; build from a checkout and pass those relay settings when registering the extension:
+The installer writes:
 
-```bash
-cd extension
-npm ci
-npm run build
-```
+- `~/.pi/remote-intercom/config.json` with relay HTTP and WebSocket URLs;
+- `~/.pi/agent/extensions/remote-intercom/index.js` with the bundled pi extension downloaded from `/extension.mjs`.
 
-Then load/register the built extension with your pi extension workflow.
+Restart pi or run `/reload` after installation so pi discovers the extension.
 
 ## Operations notes
 

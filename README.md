@@ -8,33 +8,37 @@ It includes:
 
 - a Go relay that serves HTTP bootstrap endpoints and WebSocket session traffic;
 - a TypeScript pi extension/client;
-- a relay-rendered installer script for local configuration.
+- a relay-rendered installer script that installs a bundled pi extension and local relay configuration.
 
 Channels are ephemeral live rooms keyed by channel name + PIN. The first device becomes owner; later devices require owner approval. Owner is a live role, not a permanent account: if the owner disconnects, ownership fails over to the next online member, and returns when the higher-priority member reconnects while the channel still exists.
 
 ## Quick start
 
-Run the relay:
+Build the bundled pi extension, then run the relay with the bundle path:
 
 ```bash
-cd relay
-RELAY_TOKEN_SECRET="$(openssl rand -hex 32)" go run ./cmd/relay
+cd extension
+npm ci
+npm run build:bundle
+
+cd ../relay
+RELAY_TOKEN_SECRET="$(openssl rand -hex 32)" \
+RELAY_EXTENSION_BUNDLE="$(pwd)/../extension/dist/remote-intercom-extension.mjs" \
+go run ./cmd/relay
 ```
 
-Install local client configuration from the relay. The installer writes relay URLs to `${PI_REMOTE_INTERCOM_CONFIG_DIR:-$HOME/.pi/remote-intercom}/config.json` with restrictive file permissions; it does not install a published extension package.
+Install from the relay:
 
 ```bash
 curl -fsSL http://127.0.0.1:8080/install.sh | sh
 ```
 
-Build the extension from this checkout (MVP/local registration until package publishing is available):
+The installer writes:
 
-```bash
-cd extension
-npm ci
-npm test
-npm run build
-```
+- relay config: `${PI_REMOTE_INTERCOM_CONFIG_DIR:-$HOME/.pi/remote-intercom}/config.json`
+- pi extension: `${PI_REMOTE_INTERCOM_EXTENSION_DIR:-$HOME/.pi/agent/extensions/remote-intercom}/index.js`
+
+Restart pi or run `/reload`, then use the `remote_intercom` tool.
 
 ## Architecture
 

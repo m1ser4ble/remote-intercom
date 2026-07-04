@@ -118,15 +118,56 @@ func TestInstallScriptUsesForwardedProtoAndHost(t *testing.T) {
 	if !strings.Contains(body, `RELAY_WS_URL='wss://my-relay.example.com/ws'`) {
 		t.Fatalf("install script missing wss relay url: %s", body)
 	}
+	if !strings.Contains(body, `EXTENSION_URL='https://my-relay.example.com/extension.mjs'`) {
+		t.Fatalf("install script missing extension bundle url: %s", body)
+	}
 	if !strings.Contains(body, `"relayHttpUrl": "https://my-relay.example.com"`) {
 		t.Fatalf("install script missing config http relay url: %s", body)
 	}
 	if !strings.Contains(body, `"relayWsUrl": "wss://my-relay.example.com/ws"`) {
 		t.Fatalf("install script missing config ws relay url: %s", body)
 	}
-	if !strings.Contains(body, `.pi/remote-intercom/config.json`) {
+	if !strings.Contains(body, `.pi/remote-intercom`) || !strings.Contains(body, `CONFIG_FILE="${CONFIG_DIR}/config.json"`) {
 		t.Fatalf("install script missing pi config path: %s", body)
 	}
+	if !strings.Contains(body, `.pi/agent/extensions/remote-intercom`) || !strings.Contains(body, `EXTENSION_FILE="${EXTENSION_DIR}/index.js"`) {
+		t.Fatalf("install script missing pi extension install path: %s", body)
+	}
+}
+
+func TestExtensionBundleServesConfiguredBundle(t *testing.T) {
+	bundlePath := filepath.Join(t.TempDir(), "remote-intercom-extension.mjs")
+	bundle := []byte("export default function remoteIntercom() {}\n")
+	if err := os.WriteFile(bundlePath, bundle, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_EXTENSION_BUNDLE", bundlePath)
+	handler := newTestServer(t).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/extension.mjs", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %q", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != string(bundle) {
+		t.Fatalf("bundle body = %q, want %q", got, bundle)
+	}
+	if contentType := rec.Header().Get("Content-Type"); !strings.Contains(contentType, "javascript") {
+		t.Fatalf("Content-Type = %q, want javascript", contentType)
+	}
+}
+
+func TestExtensionBundleMissingReturnsNotFound(t *testing.T) {
+	t.Setenv("RELAY_EXTENSION_BUNDLE", "")
+	handler := newTestServer(t).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/extension.mjs", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assertJSONError(t, rec, http.StatusNotFound)
 }
 
 func TestInstallScriptUsesConfiguredPublicURLs(t *testing.T) {
@@ -270,28 +311,35 @@ func TestInstallScriptIgnoresCurrentWorkingDirectoryTemplate(t *testing.T) {
 	}
 }
 
-func TestRenderedInstallScriptWritesConfigWithRestrictivePermissions(t *testing.T) {
+func TestRenderedInstallScriptWritesConfigAndExtensionWithRestrictivePermissions(t *testing.T) {
 	t.Setenv("RELAY_INSTALL_TEMPLATE", "")
-	handler := newTestServer(t).Routes()
-	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
-	req.Host = "relay.example.com:8443"
-	req.Header.Set("X-Forwarded-Proto", "https")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body = %q", rec.Code, http.StatusOK, rec.Body.String())
+	extensionBundle := "export default function remoteIntercom() {}\n"
+	extensionServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/extension.mjs" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/javascript")
+		_, _ = w.Write([]byte(extensionBundle))
+	}))
+	t.Cleanup(extensionServer.Close)
+	script, err := renderInstallScript(extensionServer.URL, "ws://relay.example.com/ws")
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	tempDir := t.TempDir()
 	configDir := filepath.Join(tempDir, "config")
+	extensionDir := filepath.Join(tempDir, "extension")
 	scriptPath := filepath.Join(tempDir, "install.sh")
-	if err := os.WriteFile(scriptPath, rec.Body.Bytes(), 0o700); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sh", scriptPath)
 	cmd.Env = append(os.Environ(),
 		"HOME="+filepath.Join(tempDir, "home"),
 		"PI_REMOTE_INTERCOM_CONFIG_DIR="+configDir,
+		"PI_REMOTE_INTERCOM_EXTENSION_DIR="+extensionDir,
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -310,11 +358,11 @@ func TestRenderedInstallScriptWritesConfigWithRestrictivePermissions(t *testing.
 	if err := json.Unmarshal(configBytes, &config); err != nil {
 		t.Fatalf("config.json is not valid JSON: %v\n%s", err, configBytes)
 	}
-	if config.RelayHTTPURL != "https://relay.example.com:8443" {
-		t.Fatalf("relayHttpUrl = %q, want https://relay.example.com:8443", config.RelayHTTPURL)
+	if config.RelayHTTPURL != extensionServer.URL {
+		t.Fatalf("relayHttpUrl = %q, want %s", config.RelayHTTPURL, extensionServer.URL)
 	}
-	if config.RelayWSURL != "wss://relay.example.com:8443/ws" {
-		t.Fatalf("relayWsUrl = %q, want wss://relay.example.com:8443/ws", config.RelayWSURL)
+	if config.RelayWSURL != "ws://relay.example.com/ws" {
+		t.Fatalf("relayWsUrl = %q, want ws://relay.example.com/ws", config.RelayWSURL)
 	}
 	info, err := os.Stat(configPath)
 	if err != nil {
@@ -322,6 +370,21 @@ func TestRenderedInstallScriptWritesConfigWithRestrictivePermissions(t *testing.
 	}
 	if got := info.Mode().Perm(); got&0o077 != 0 {
 		t.Fatalf("config file permissions = %v, want no group/world permissions", got)
+	}
+	extensionPath := filepath.Join(extensionDir, "index.js")
+	extensionBytes, err := os.ReadFile(extensionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(extensionBytes) != extensionBundle {
+		t.Fatalf("extension bundle = %q, want %q", extensionBytes, extensionBundle)
+	}
+	extensionInfo, err := os.Stat(extensionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := extensionInfo.Mode().Perm(); got&0o077 != 0 {
+		t.Fatalf("extension file permissions = %v, want no group/world permissions", got)
 	}
 }
 
