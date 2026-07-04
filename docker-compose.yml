@@ -1,0 +1,11 @@
+services:
+  relay:
+    image: golang:1.22
+    working_dir: /app
+    volumes:
+      - ./relay:/app
+    command: ["go", "run", "./cmd/relay"]
+    environment:
+      RELAY_ADDR: ":8080"
+    ports:
+      - "8080:8080"
