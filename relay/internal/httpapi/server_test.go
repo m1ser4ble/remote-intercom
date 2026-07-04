@@ -89,12 +89,101 @@ func TestInstallScriptUsesForwardedProtoAndHost(t *testing.T) {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, `RELAY_HTTP_URL="https://my-relay.example.com"`) {
+	if !strings.Contains(body, `RELAY_HTTP_URL='https://my-relay.example.com'`) {
 		t.Fatalf("install script missing https relay url: %s", body)
 	}
-	if !strings.Contains(body, `RELAY_WS_URL="wss://my-relay.example.com/ws"`) {
+	if !strings.Contains(body, `RELAY_WS_URL='wss://my-relay.example.com/ws'`) {
 		t.Fatalf("install script missing wss relay url: %s", body)
 	}
+}
+
+func TestInstallScriptUsesConfiguredPublicURLs(t *testing.T) {
+	server := newTestServer(t)
+	server.PublicHTTPURL = "https://public.example.com/a'b"
+	server.PublicWSURL = "wss://public.example.com/ws"
+	handler := server.Routes()
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "ignored.example.com$(bad)"
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `RELAY_HTTP_URL='https://public.example.com/a'\''b'`) {
+		t.Fatalf("install script missing quoted configured http relay url: %s", body)
+	}
+	if !strings.Contains(body, `RELAY_WS_URL='wss://public.example.com/ws'`) {
+		t.Fatalf("install script missing configured ws relay url: %s", body)
+	}
+	if strings.Contains(body, "ignored.example.com") {
+		t.Fatalf("install script reflected request host despite configured URLs: %s", body)
+	}
+}
+
+func TestInstallScriptRejectsHostileHost(t *testing.T) {
+	handler := newTestServer(t).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "relay.example.com$(touch /tmp/pwned)"
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assertJSONError(t, rec, http.StatusBadRequest)
+}
+
+func TestInvalidForwardedProtoFallsBackToHTTP(t *testing.T) {
+	handler := newTestServer(t).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "my-relay.example.com"
+	req.Header.Set("X-Forwarded-Proto", "javascript")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "javascript://") {
+		t.Fatalf("invalid forwarded proto was reflected: %s", body)
+	}
+	if !strings.Contains(body, `RELAY_HTTP_URL='http://my-relay.example.com'`) {
+		t.Fatalf("install script missing fallback http relay url: %s", body)
+	}
+	if !strings.Contains(body, `RELAY_WS_URL='ws://my-relay.example.com/ws'`) {
+		t.Fatalf("install script missing fallback ws relay url: %s", body)
+	}
+}
+
+func TestConnectInvalidJSONReturnsJSONError(t *testing.T) {
+	handler := newTestServer(t).Routes()
+	rec := postRawConnect(t, handler, `{"channelName":`)
+
+	assertJSONError(t, rec, http.StatusBadRequest)
+}
+
+func TestConnectUnknownFieldReturnsJSONError(t *testing.T) {
+	handler := newTestServer(t).Routes()
+	rec := postRawConnect(t, handler, `{"channelName":"ops","pin":"123456","deviceName":"alice-laptop","unknown":true}`)
+
+	assertJSONError(t, rec, http.StatusBadRequest)
+}
+
+func TestConnectTrailingJSONReturnsJSONError(t *testing.T) {
+	handler := newTestServer(t).Routes()
+	rec := postRawConnect(t, handler, `{"channelName":"ops","pin":"123456","deviceName":"alice-laptop"}{}`)
+
+	assertJSONError(t, rec, http.StatusBadRequest)
+}
+
+func TestConnectMissingFieldsReturnsJSONError(t *testing.T) {
+	handler := newTestServer(t).Routes()
+	rec := postRawConnect(t, handler, `{"channelName":"ops"}`)
+
+	assertJSONError(t, rec, http.StatusBadRequest)
 }
 
 func TestHealthzAndVersion(t *testing.T) {
@@ -140,10 +229,7 @@ func postConnect(t *testing.T, handler http.Handler, request protocol.ConnectReq
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/channels/connect", bytes.NewReader(body))
-	req.Host = "relay.test"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+	rec := postRawConnect(t, handler, string(body))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("connect status = %d, body = %q", rec.Code, rec.Body.String())
 	}
@@ -152,4 +238,30 @@ func postConnect(t *testing.T, handler http.Handler, request protocol.ConnectReq
 		t.Fatalf("connect response is not json: %v", err)
 	}
 	return response
+}
+
+func postRawConnect(t *testing.T, handler http.Handler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/channels/connect", bytes.NewReader([]byte(body)))
+	req.Host = "relay.test"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func assertJSONError(t *testing.T, rec *httptest.ResponseRecorder, status int) {
+	t.Helper()
+	if rec.Code != status {
+		t.Fatalf("status = %d, want %d, body = %q", rec.Code, status, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("content-type = %q, want application/json", got)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("error response is not json: %v", err)
+	}
+	if payload["error"] == "" {
+		t.Fatalf("error response missing error: %s", rec.Body.String())
+	}
 }

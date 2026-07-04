@@ -4,22 +4,31 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/remote-intercom/remote-intercom/relay/internal/auth"
 	"github.com/remote-intercom/remote-intercom/relay/internal/channel"
 	"github.com/remote-intercom/remote-intercom/relay/internal/protocol"
 )
 
-const defaultVersion = "0.1.0"
+const (
+	defaultVersion   = "0.1.0"
+	maxJSONBodyBytes = 64 * 1024
+)
 
 // Server exposes the relay bootstrap HTTP API.
 type Server struct {
-	Registry     *channel.Registry
-	TokenManager *auth.TokenManager
-	Version      string
+	Registry      *channel.Registry
+	TokenManager  *auth.TokenManager
+	Version       string
+	PublicHTTPURL string
+	PublicWSURL   string
 }
 
 func NewServer(registry *channel.Registry, tokenManager *auth.TokenManager, version string) *Server {
@@ -48,35 +57,37 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
-	httpURL, wsURL := relayURLs(r)
+	httpURL, wsURL, err := s.relayURLs(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid relay URL")
+		return
+	}
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, `#!/usr/bin/env sh
 set -eu
 
-RELAY_HTTP_URL=%q
-RELAY_WS_URL=%q
+RELAY_HTTP_URL=%s
+RELAY_WS_URL=%s
 export RELAY_HTTP_URL RELAY_WS_URL
 
 echo "Remote Intercom relay configured: ${RELAY_HTTP_URL}"
-`, httpURL, wsURL)
+`, shellQuote(httpURL), shellQuote(wsURL))
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if s.Registry == nil {
-		http.Error(w, "registry is not configured", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "registry is not configured")
 		return
 	}
 	if s.TokenManager == nil {
-		http.Error(w, "token manager is not configured", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "token manager is not configured")
 		return
 	}
 
 	var request protocol.ConnectRequest
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
-		http.Error(w, "invalid connect request", http.StatusBadRequest)
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid connect request")
 		return
 	}
 
@@ -85,21 +96,27 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	request.DeviceName = strings.TrimSpace(request.DeviceName)
 	request.DeviceID = strings.TrimSpace(request.DeviceID)
 	if request.ChannelName == "" || request.PIN == "" || request.DeviceName == "" {
-		http.Error(w, "channelName, pin, and deviceName are required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "channelName, pin, and deviceName are required")
 		return
 	}
 	if request.DeviceID == "" {
 		deviceID, err := generateDeviceID()
 		if err != nil {
-			http.Error(w, "could not generate device id", http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "could not generate device id")
 			return
 		}
 		request.DeviceID = deviceID
 	}
 
+	publicWSURL, err := s.wsURL(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid relay URL")
+		return
+	}
+
 	result := s.Registry.Connect(request.ChannelName, request.PIN, request.DeviceID, request.DeviceName)
 	if result.Channel == nil {
-		http.Error(w, "channel connect failed", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "channel connect failed")
 		return
 	}
 
@@ -107,26 +124,25 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		Status:    string(result.Status),
 		ChannelID: result.Channel.ID,
 		DeviceID:  request.DeviceID,
-		WSURL:     wsURL(r),
+		WSURL:     publicWSURL,
 	}
 
-	var err error
 	switch result.Status {
 	case channel.StatusCreated, channel.StatusConnected:
 		response.Token, err = s.TokenManager.IssueMember(response.ChannelID, response.DeviceID)
 	case channel.StatusPending:
 		if result.JoinRequest == nil {
-			http.Error(w, "join request missing", http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "join request missing")
 			return
 		}
 		response.JoinRequestID = result.JoinRequest.ID
 		response.Token, err = s.TokenManager.IssuePending(response.ChannelID, response.DeviceID, response.JoinRequestID)
 	default:
-		http.Error(w, "unknown connect status", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "unknown connect status")
 		return
 	}
 	if err != nil {
-		http.Error(w, "could not issue token", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "could not issue token")
 		return
 	}
 
@@ -139,36 +155,144 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func relayURLs(r *http.Request) (string, string) {
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	body := http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+
+	var extra struct{}
+	if err := decoder.Decode(&extra); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	return errors.New("request body contains multiple JSON values")
+}
+
+func (s *Server) relayURLs(r *http.Request) (string, string, error) {
+	var httpURL string
+	var wsURL string
+	var err error
+
+	if s.PublicHTTPURL != "" {
+		httpURL, err = validatePublicURL(s.PublicHTTPURL, "http", "https")
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if s.PublicWSURL != "" {
+		wsURL, err = validatePublicURL(s.PublicWSURL, "ws", "wss")
+		if err != nil {
+			return "", "", err
+		}
+	}
+	if httpURL != "" && wsURL != "" {
+		return httpURL, wsURL, nil
+	}
+
+	inferredHTTPURL, inferredWSURL, err := inferRelayURLs(r)
+	if err != nil {
+		return "", "", err
+	}
+	if httpURL == "" {
+		httpURL = inferredHTTPURL
+	}
+	if wsURL == "" {
+		wsURL = inferredWSURL
+	}
+	return httpURL, wsURL, nil
+}
+
+func (s *Server) wsURL(r *http.Request) (string, error) {
+	if s.PublicWSURL != "" {
+		return validatePublicURL(s.PublicWSURL, "ws", "wss")
+	}
+	_, wsURL, err := inferRelayURLs(r)
+	return wsURL, err
+}
+
+func inferRelayURLs(r *http.Request) (string, string, error) {
 	proto := requestProto(r)
-	host := requestHost(r)
+	host, err := requestHost(r, proto)
+	if err != nil {
+		return "", "", err
+	}
 	wsScheme := "ws"
 	if proto == "https" {
 		wsScheme = "wss"
 	}
-	return proto + "://" + host, wsScheme + "://" + host + "/ws"
-}
-
-func wsURL(r *http.Request) string {
-	_, wsURL := relayURLs(r)
-	return wsURL
+	return proto + "://" + host, wsScheme + "://" + host + "/ws", nil
 }
 
 func requestProto(r *http.Request) string {
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
-		if comma := strings.Index(forwarded, ","); comma >= 0 {
-			forwarded = forwarded[:comma]
-		}
-		return strings.ToLower(strings.TrimSpace(forwarded))
+	forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	if strings.EqualFold(forwarded, "https") {
+		return "https"
+	}
+	if strings.EqualFold(forwarded, "http") {
+		return "http"
 	}
 	return "http"
 }
 
-func requestHost(r *http.Request) string {
-	if r.Host != "" {
-		return r.Host
+func requestHost(r *http.Request, scheme string) (string, error) {
+	host := r.Host
+	if host == "" {
+		return "", errors.New("missing host")
 	}
-	return r.URL.Host
+	for _, r := range host {
+		if unsafeHostRune(r) {
+			return "", errors.New("unsafe host")
+		}
+	}
+	u, err := url.Parse(scheme + "://" + host)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme != scheme || u.Host == "" || u.Host != host || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("invalid host")
+	}
+	return host, nil
+}
+
+func unsafeHostRune(r rune) bool {
+	if unicode.IsControl(r) || unicode.IsSpace(r) {
+		return true
+	}
+	switch r {
+	case '/', '\\', '$', '`', '\'', '"', ';', '&', '|', '(', ')', '<', '>':
+		return true
+	default:
+		return false
+	}
+}
+
+func validatePublicURL(raw string, allowedSchemes ...string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", errors.New("missing URL scheme or host")
+	}
+	for _, scheme := range allowedSchemes {
+		if strings.EqualFold(u.Scheme, scheme) {
+			return raw, nil
+		}
+	}
+	return "", errors.New("invalid URL scheme")
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func generateDeviceID() (string, error) {
