@@ -51,14 +51,23 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 	}
 	bobWS := dialMemberWS(t, bob.WSURL, bob.Token)
 
-	joinRequest := readUntil(t, aliceWS, func(event protocol.Event) bool {
-		return event.Type == "join.request" && event.From == "dev_bob"
+	joinRequest := readUntil(t, aliceWS, "join.request", func(event protocol.Event) bool {
+		return event.From == "dev_bob"
 	})
+	if joinRequest.ChannelID != alice.ChannelID {
+		t.Fatalf("join request channel id = %q, want %q", joinRequest.ChannelID, alice.ChannelID)
+	}
 	if joinRequest.To != "dev_alice" {
 		t.Fatalf("join request to = %q, want dev_alice", joinRequest.To)
 	}
 	if got := stringPayload(t, joinRequest.Payload, "joinRequestId"); got != bob.JoinRequestID {
 		t.Fatalf("join request id = %q, want %q", got, bob.JoinRequestID)
+	}
+	if got := stringPayload(t, joinRequest.Payload, "deviceId"); got != "dev_bob" {
+		t.Fatalf("join request device id = %q, want dev_bob", got)
+	}
+	if got := stringPayload(t, joinRequest.Payload, "deviceName"); got != "bob-laptop" {
+		t.Fatalf("join request device name = %q, want bob-laptop", got)
 	}
 
 	writeEvent(t, aliceWS, protocol.Event{
@@ -68,9 +77,18 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 			"joinRequestId": bob.JoinRequestID,
 		},
 	})
-	approved := readUntil(t, bobWS, func(event protocol.Event) bool { return event.Type == "join.approved" })
-	if approved.From != "dev_alice" || approved.To != "dev_bob" || approved.ReplyTo != "approve-bob" {
-		t.Fatalf("join approval route = from %q to %q replyTo %q, want dev_alice -> dev_bob replyTo approve-bob", approved.From, approved.To, approved.ReplyTo)
+	approved := readUntil(t, bobWS, "join.approved", func(event protocol.Event) bool { return event.ReplyTo == "approve-bob" })
+	if approved.ChannelID != alice.ChannelID {
+		t.Fatalf("join approval channel id = %q, want %q", approved.ChannelID, alice.ChannelID)
+	}
+	if approved.From != "dev_alice" || approved.To != "dev_bob" {
+		t.Fatalf("join approval route = from %q to %q, want dev_alice -> dev_bob", approved.From, approved.To)
+	}
+	if got := stringPayload(t, approved.Payload, "joinRequestId"); got != bob.JoinRequestID {
+		t.Fatalf("join approval request id = %q, want %q", got, bob.JoinRequestID)
+	}
+	if got := stringPayload(t, approved.Payload, "deviceId"); got != "dev_bob" {
+		t.Fatalf("join approval device id = %q, want dev_bob", got)
 	}
 
 	writeEvent(t, aliceWS, protocol.Event{
@@ -82,8 +100,8 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 			"text": "hello bob",
 		},
 	})
-	message := readUntil(t, bobWS, func(event protocol.Event) bool { return event.ID == "send-1" })
-	assertMessage(t, message, "dev_alice", "dev_bob", "send", "hello bob", "")
+	message := readUntil(t, bobWS, "message.send", func(event protocol.Event) bool { return event.ID == "send-1" })
+	assertMessage(t, message, alice.ChannelID, "dev_alice", "dev_bob", "send", "hello bob", "")
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "ask-1",
@@ -94,8 +112,8 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 			"text": "approve deploy?",
 		},
 	})
-	ask := readUntil(t, bobWS, func(event protocol.Event) bool { return event.ID == "ask-1" })
-	assertMessage(t, ask, "dev_alice", "dev_bob", "ask", "approve deploy?", "")
+	ask := readUntil(t, bobWS, "message.send", func(event protocol.Event) bool { return event.ID == "ask-1" })
+	assertMessage(t, ask, alice.ChannelID, "dev_alice", "dev_bob", "ask", "approve deploy?", "")
 
 	writeEvent(t, bobWS, protocol.Event{
 		ID:      "reply-1",
@@ -107,13 +125,13 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 			"text": "approved",
 		},
 	})
-	reply := readUntil(t, aliceWS, func(event protocol.Event) bool { return event.ID == "reply-1" })
-	assertMessage(t, reply, "dev_bob", "dev_alice", "reply", "approved", "ask-1")
+	reply := readUntil(t, aliceWS, "message.send", func(event protocol.Event) bool { return event.ID == "reply-1" })
+	assertMessage(t, reply, alice.ChannelID, "dev_bob", "dev_alice", "reply", "approved", "ask-1")
 
 	if err := aliceWS.Close(websocket.StatusNormalClosure, "e2e disconnect alice"); err != nil {
 		t.Fatalf("close alice websocket: %v", err)
 	}
-	waitForOwner(t, bobWS, "dev_bob")
+	waitForOwner(t, bobWS, alice.ChannelID, "dev_bob", bob.JoinRequestID, "dev_bob")
 
 	reconnectedAlice := fixture.connect(t, protocol.ConnectRequest{
 		ChannelName:   "ops room",
@@ -129,7 +147,7 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 		t.Fatalf("reconnected alice channel id = %q, want %q", reconnectedAlice.ChannelID, alice.ChannelID)
 	}
 	reconnectedAliceWS := dialMemberWS(t, reconnectedAlice.WSURL, reconnectedAlice.Token)
-	waitForOwner(t, reconnectedAliceWS, "dev_alice")
+	waitForOwner(t, reconnectedAliceWS, alice.ChannelID, "dev_alice", "", "dev_alice")
 }
 
 type relayFixture struct {
@@ -156,7 +174,8 @@ func (f relayFixture) connect(t *testing.T, request protocol.ConnectRequest) pro
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Post(f.server.URL+"/channels/connect", "application/json", bytes.NewReader(body))
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(f.server.URL+"/channels/connect", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,10 +216,14 @@ func dialMemberWS(t *testing.T, wsURLValue, token string) *websocket.Conn {
 	return conn
 }
 
-func readUntil(t *testing.T, conn *websocket.Conn, match func(protocol.Event) bool) protocol.Event {
+func readUntil(t *testing.T, conn *websocket.Conn, expectedType string, match func(protocol.Event) bool, allowedIntermediaryTypes ...string) protocol.Event {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	var seen []string
+	allowedIntermediaries := make(map[string]struct{}, len(allowedIntermediaryTypes))
+	for _, eventType := range allowedIntermediaryTypes {
+		allowedIntermediaries[eventType] = struct{}{}
+	}
 	for time.Now().Before(deadline) {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -220,11 +243,21 @@ func readUntil(t *testing.T, conn *websocket.Conn, match func(protocol.Event) bo
 			t.Fatalf("invalid event JSON %q: %v", string(data), err)
 		}
 		seen = append(seen, fmt.Sprintf("%s/%s", event.Type, event.ID))
+		if event.Type == "error" {
+			t.Fatalf("received error event while waiting for %s after seeing [%s]: replyTo=%q payload=%v", expectedType, joinSeen(seen), event.ReplyTo, event.Payload)
+		}
+		if event.Type != expectedType {
+			if _, ok := allowedIntermediaries[event.Type]; ok {
+				continue
+			}
+			t.Fatalf("unexpected event type = %q, want %q after seeing [%s]", event.Type, expectedType, joinSeen(seen))
+		}
 		if match(event) {
 			return event
 		}
+		t.Fatalf("unexpected %s event after seeing [%s]: id=%q from=%q to=%q replyTo=%q payload=%v", expectedType, joinSeen(seen), event.ID, event.From, event.To, event.ReplyTo, event.Payload)
 	}
-	t.Fatalf("timed out waiting for matching websocket event after seeing [%s]", joinSeen(seen))
+	t.Fatalf("timed out waiting for %s websocket event after seeing [%s]", expectedType, joinSeen(seen))
 	return protocol.Event{}
 }
 
@@ -241,7 +274,7 @@ func writeEvent(t *testing.T, conn *websocket.Conn, event protocol.Event) {
 	}
 }
 
-func waitForOwner(t *testing.T, conn *websocket.Conn, wantOwnerID string) {
+func waitForOwner(t *testing.T, conn *websocket.Conn, channelID, deviceID, joinRequestID, wantOwnerID string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	attempt := 0
@@ -250,9 +283,10 @@ func waitForOwner(t *testing.T, conn *websocket.Conn, wantOwnerID string) {
 		attempt++
 		eventID := fmt.Sprintf("status-%s-%d", wantOwnerID, attempt)
 		writeEvent(t, conn, protocol.Event{ID: eventID, Type: "status.request"})
-		status := readUntil(t, conn, func(event protocol.Event) bool {
-			return event.Type == "status.response" && event.ReplyTo == eventID
+		status := readUntil(t, conn, "status.response", func(event protocol.Event) bool {
+			return event.ReplyTo == eventID
 		})
+		assertStatusResponse(t, status, channelID, deviceID, joinRequestID)
 		lastOwnerID = stringPayload(t, status.Payload, "ownerId")
 		if lastOwnerID == wantOwnerID {
 			return
@@ -262,10 +296,38 @@ func waitForOwner(t *testing.T, conn *websocket.Conn, wantOwnerID string) {
 	t.Fatalf("owner id = %q, want %q", lastOwnerID, wantOwnerID)
 }
 
-func assertMessage(t *testing.T, event protocol.Event, from, to, kind, text, replyTo string) {
+func assertStatusResponse(t *testing.T, event protocol.Event, channelID, deviceID, joinRequestID string) {
+	t.Helper()
+	if event.Type != "status.response" {
+		t.Fatalf("event type = %q, want status.response", event.Type)
+	}
+	if event.ChannelID != channelID {
+		t.Fatalf("status response channel id = %q, want %q", event.ChannelID, channelID)
+	}
+	if event.To != deviceID {
+		t.Fatalf("status response to = %q, want %q", event.To, deviceID)
+	}
+	if got := stringPayload(t, event.Payload, "status"); got != "member" {
+		t.Fatalf("status response status = %q, want member", got)
+	}
+	if got := stringPayload(t, event.Payload, "channelId"); got != channelID {
+		t.Fatalf("status response payload channel id = %q, want %q", got, channelID)
+	}
+	if got := stringPayload(t, event.Payload, "deviceId"); got != deviceID {
+		t.Fatalf("status response payload device id = %q, want %q", got, deviceID)
+	}
+	if got := stringPayload(t, event.Payload, "joinRequestId"); got != joinRequestID {
+		t.Fatalf("status response payload join request id = %q, want %q", got, joinRequestID)
+	}
+}
+
+func assertMessage(t *testing.T, event protocol.Event, channelID, from, to, kind, text, replyTo string) {
 	t.Helper()
 	if event.Type != "message.send" {
 		t.Fatalf("event type = %q, want message.send", event.Type)
+	}
+	if event.ChannelID != channelID {
+		t.Fatalf("message channel id = %q, want %q", event.ChannelID, channelID)
 	}
 	if event.From != from || event.To != to {
 		t.Fatalf("message route = %q -> %q, want %q -> %q", event.From, event.To, from, to)
