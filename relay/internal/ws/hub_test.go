@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -143,6 +144,78 @@ func TestPendingConnectionCannotRouteMessages(t *testing.T) {
 	}
 }
 
+func TestDeniedPendingConnectionReceivesDeniedThenCloses(t *testing.T) {
+	server := newRelayServer(t)
+
+	alice := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+	bob := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
+	_ = readEvent(t, aliceWS) // join.request
+
+	writeEvent(t, aliceWS, protocol.Event{
+		ID:   "deny-1",
+		Type: "join.deny",
+		Payload: map[string]any{
+			"joinRequestId": bob.JoinRequestID,
+		},
+	})
+
+	denied := readEvent(t, bobWS)
+	if denied.Type != "join.denied" {
+		t.Fatalf("event type = %q, want join.denied", denied.Type)
+	}
+	if denied.ReplyTo != "deny-1" {
+		t.Fatalf("replyTo = %q, want deny-1", denied.ReplyTo)
+	}
+
+	assertCloseStatus(t, bobWS, websocket.StatusPolicyViolation)
+	if err := writeEventMaybe(bobWS, protocol.Event{ID: "status-after-deny", Type: "status.request"}); err == nil {
+		t.Fatal("expected denied connection status request to fail")
+	}
+}
+
+func TestDuplicateMemberConnectionRevokesOldConnection(t *testing.T) {
+	server := newRelayServer(t)
+
+	alice := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+	bob := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
+	_ = readEvent(t, aliceWS) // join.request
+
+	writeEvent(t, aliceWS, protocol.Event{
+		ID:   "approve-1",
+		Type: "join.approve",
+		Payload: map[string]any{
+			"joinRequestId": bob.JoinRequestID,
+		},
+	})
+	approved := readEvent(t, bobWS)
+	if approved.Type != "join.approved" {
+		t.Fatalf("event type = %q, want join.approved", approved.Type)
+	}
+
+	reconnected := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice-new", DeviceID: "dev_alice"})
+	if reconnected.Status != string(channel.StatusConnected) {
+		t.Fatalf("status = %q, want %q", reconnected.Status, channel.StatusConnected)
+	}
+	_ = dialWSWithTokenQuery(t, reconnected.WSURL, reconnected.Token)
+
+	assertCloseStatus(t, aliceWS, websocket.StatusPolicyViolation)
+	if err := writeEventMaybe(aliceWS, protocol.Event{
+		ID:   "send-from-stale",
+		Type: "message.send",
+		To:   "dev_bob",
+		Payload: map[string]any{
+			"text": "from stale alice",
+		},
+	}); err == nil {
+		t.Fatal("expected superseded connection send to fail")
+	}
+	assertNoEvent(t, bobWS, 200*time.Millisecond)
+}
+
 func TestWebSocketRejectsInvalidToken(t *testing.T) {
 	server := newRelayServer(t)
 
@@ -242,15 +315,46 @@ func readEvent(t *testing.T, conn *websocket.Conn) protocol.Event {
 
 func writeEvent(t *testing.T, conn *websocket.Conn, event protocol.Event) {
 	t.Helper()
+	if err := writeEventMaybe(conn, event); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeEventMaybe(conn *websocket.Conn, event protocol.Event) error {
 	data, err := json.Marshal(event)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
-		t.Fatal(err)
+	return conn.Write(ctx, websocket.MessageText, data)
+}
+
+func assertCloseStatus(t *testing.T, conn *websocket.Conn, want websocket.StatusCode) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := conn.Read(ctx)
+	if err == nil {
+		t.Fatal("expected websocket close")
 	}
+	if got := websocket.CloseStatus(err); got != want {
+		t.Fatalf("close status = %d, want %d (err: %v)", got, want, err)
+	}
+}
+
+func assertNoEvent(t *testing.T, conn *websocket.Conn, duration time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+	messageType, data, err := conn.Read(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("unexpected read error while waiting for no event: %v", err)
+	}
+	t.Fatalf("unexpected message type %v: %s", messageType, string(data))
 }
 
 func stringPayload(t *testing.T, payload map[string]any, key string) string {

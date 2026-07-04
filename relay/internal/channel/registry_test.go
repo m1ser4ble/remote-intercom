@@ -126,6 +126,51 @@ func TestOwnerFailoverAndRestore(t *testing.T) {
 	}
 }
 
+func TestStaleOwnerCannotApproveAfterFailover(t *testing.T) {
+	r := NewRegistry()
+	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	member := r.Connect("dwkim", "1234", "dev_b", "mini")
+	if err := r.Approve(created.Channel.ID, member.JoinRequest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetOnline(created.Channel.ID, "dev_a", false); err != nil {
+		t.Fatal(err)
+	}
+	pending := r.Connect("dwkim", "1234", "dev_c", "phone")
+
+	if err := r.ApproveByOwner(created.Channel.ID, "dev_a", pending.JoinRequest.ID); err == nil {
+		t.Fatal("expected stale owner approval error")
+	}
+	ch := r.Channel(created.Channel.ID)
+	if _, ok := ch.Members["dev_c"]; ok {
+		t.Fatal("stale owner admitted dev_c")
+	}
+	if _, ok := ch.PendingJoins[pending.JoinRequest.ID]; !ok {
+		t.Fatal("stale owner removed pending join")
+	}
+}
+
+func TestStaleOwnerCannotDenyAfterFailover(t *testing.T) {
+	r := NewRegistry()
+	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	member := r.Connect("dwkim", "1234", "dev_b", "mini")
+	if err := r.Approve(created.Channel.ID, member.JoinRequest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetOnline(created.Channel.ID, "dev_a", false); err != nil {
+		t.Fatal(err)
+	}
+	pending := r.Connect("dwkim", "1234", "dev_c", "phone")
+
+	if err := r.DenyByOwner(created.Channel.ID, "dev_a", pending.JoinRequest.ID); err == nil {
+		t.Fatal("expected stale owner denial error")
+	}
+	ch := r.Channel(created.Channel.ID)
+	if _, ok := ch.PendingJoins[pending.JoinRequest.ID]; !ok {
+		t.Fatal("stale owner removed pending join")
+	}
+}
+
 func TestDenyRemovesPendingJoin(t *testing.T) {
 	r := NewRegistry()
 	r.Connect("dwkim", "1234", "dev_a", "macbook")

@@ -3,6 +3,7 @@ package channel
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -15,6 +16,8 @@ const (
 	StatusPending   Status = "pending_approval"
 	StatusConnected Status = "connected"
 )
+
+var ErrNotCurrentOwner = errors.New("only the current owner can decide join requests")
 
 type Registry struct {
 	mu           sync.RWMutex
@@ -112,24 +115,21 @@ func (r *Registry) Approve(channelID, joinRequestID string) error {
 	if !ok {
 		return fmt.Errorf("channel %q not found", channelID)
 	}
-	join, ok := ch.PendingJoins[joinRequestID]
+	return approveLocked(ch, joinRequestID)
+}
+
+func (r *Registry) ApproveByOwner(channelID, ownerDeviceID, joinRequestID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ch, ok := r.channels[channelID]
 	if !ok {
-		return fmt.Errorf("join request %q not found", joinRequestID)
+		return fmt.Errorf("channel %q not found", channelID)
 	}
-
-	if _, ok := ch.Members[join.DeviceID]; ok {
-		return fmt.Errorf("device %q is already a member", join.DeviceID)
+	if ch.CurrentOwnerID != ownerDeviceID {
+		return ErrNotCurrentOwner
 	}
-
-	ch.Members[join.DeviceID] = Member{
-		DeviceID:   join.DeviceID,
-		DeviceName: join.DeviceName,
-		Online:     true,
-		Priority:   nextPriority(ch),
-	}
-	deletePendingJoinsForDevice(ch, join.DeviceID)
-	recomputeOwner(ch)
-	return nil
+	return approveLocked(ch, joinRequestID)
 }
 
 func (r *Registry) Deny(channelID, joinRequestID string) error {
@@ -140,11 +140,33 @@ func (r *Registry) Deny(channelID, joinRequestID string) error {
 	if !ok {
 		return fmt.Errorf("channel %q not found", channelID)
 	}
-	if _, ok := ch.PendingJoins[joinRequestID]; !ok {
-		return fmt.Errorf("join request %q not found", joinRequestID)
+	return denyLocked(ch, joinRequestID)
+}
+
+func (r *Registry) DenyByOwner(channelID, ownerDeviceID, joinRequestID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ch, ok := r.channels[channelID]
+	if !ok {
+		return fmt.Errorf("channel %q not found", channelID)
 	}
-	delete(ch.PendingJoins, joinRequestID)
-	return nil
+	if ch.CurrentOwnerID != ownerDeviceID {
+		return ErrNotCurrentOwner
+	}
+	return denyLocked(ch, joinRequestID)
+}
+
+func (r *Registry) PendingExists(channelID, deviceID, joinRequestID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	ch, ok := r.channels[channelID]
+	if !ok {
+		return false
+	}
+	join, ok := ch.PendingJoins[joinRequestID]
+	return ok && join.DeviceID == deviceID
 }
 
 func (r *Registry) SetOnline(channelID, deviceID string, online bool) error {
@@ -194,6 +216,35 @@ func (r *Registry) nextJoinID(channelID, deviceID string) string {
 	r.joinSeq++
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d", channelID, deviceID, r.joinSeq)))
 	return "join_" + hex.EncodeToString(sum[:8])
+}
+
+func approveLocked(ch *Channel, joinRequestID string) error {
+	join, ok := ch.PendingJoins[joinRequestID]
+	if !ok {
+		return fmt.Errorf("join request %q not found", joinRequestID)
+	}
+
+	if _, ok := ch.Members[join.DeviceID]; ok {
+		return fmt.Errorf("device %q is already a member", join.DeviceID)
+	}
+
+	ch.Members[join.DeviceID] = Member{
+		DeviceID:   join.DeviceID,
+		DeviceName: join.DeviceName,
+		Online:     true,
+		Priority:   nextPriority(ch),
+	}
+	deletePendingJoinsForDevice(ch, join.DeviceID)
+	recomputeOwner(ch)
+	return nil
+}
+
+func denyLocked(ch *Channel, joinRequestID string) error {
+	if _, ok := ch.PendingJoins[joinRequestID]; !ok {
+		return fmt.Errorf("join request %q not found", joinRequestID)
+	}
+	delete(ch.PendingJoins, joinRequestID)
+	return nil
 }
 
 func pendingJoinForDevice(ch *Channel, deviceID string) (JoinRequest, bool) {

@@ -83,7 +83,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.register(client)
+	previous := h.register(client)
+	if previous != nil {
+		_ = previous.close(websocket.StatusPolicyViolation, "connection superseded")
+	}
 	defer h.unregister(client)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
@@ -157,6 +160,9 @@ func (h *Hub) validateClaims(claims *auth.Claims) error {
 }
 
 func (h *Hub) handleEvent(c *connection, event protocol.Event) {
+	if !h.connectionCanSend(c) {
+		return
+	}
 	if event.ChannelID != "" && event.ChannelID != c.channelID {
 		c.sendError("unauthorized", "event channel does not match token", event.ID)
 		return
@@ -243,10 +249,6 @@ func (h *Hub) handleJoinDecision(c *connection, event protocol.Event, approve bo
 		c.sendError("invalid_event", "channel not found", event.ID)
 		return
 	}
-	if ch.CurrentOwnerID != c.deviceID {
-		c.sendError("unauthorized", "only the current owner can decide join requests", event.ID)
-		return
-	}
 	join, ok := ch.PendingJoins[joinRequestID]
 	if !ok {
 		joinRequestID, join, ok = pendingJoinByDevice(ch, event.To)
@@ -258,11 +260,15 @@ func (h *Hub) handleJoinDecision(c *connection, event protocol.Event, approve bo
 
 	var err error
 	if approve {
-		err = h.registry.Approve(c.channelID, joinRequestID)
+		err = h.registry.ApproveByOwner(c.channelID, c.deviceID, joinRequestID)
 	} else {
-		err = h.registry.Deny(c.channelID, joinRequestID)
+		err = h.registry.DenyByOwner(c.channelID, c.deviceID, joinRequestID)
 	}
 	if err != nil {
+		if errors.Is(err, channel.ErrNotCurrentOwner) {
+			c.sendError("unauthorized", err.Error(), event.ID)
+			return
+		}
 		c.sendError("invalid_event", err.Error(), event.ID)
 		return
 	}
@@ -273,7 +279,10 @@ func (h *Hub) handleJoinDecision(c *connection, event protocol.Event, approve bo
 	}
 
 	if approve {
-		h.promotePending(pendingConn)
+		previous := h.promotePending(pendingConn)
+		if previous != nil {
+			_ = previous.close(websocket.StatusPolicyViolation, "connection superseded")
+		}
 		_ = pendingConn.writeEvent(protocol.Event{
 			Type:      "join.approved",
 			ChannelID: c.channelID,
@@ -299,6 +308,8 @@ func (h *Hub) handleJoinDecision(c *connection, event protocol.Event, approve bo
 			"deviceId":      join.DeviceID,
 		},
 	})
+	h.removePending(pendingConn)
+	_ = pendingConn.close(websocket.StatusPolicyViolation, "join denied")
 }
 
 func joinRequestIDFromEvent(event protocol.Event) string {
@@ -403,7 +414,42 @@ func (h *Hub) notifyOwnerOfJoin(c *connection) {
 	})
 }
 
-func (h *Hub) register(c *connection) {
+func (h *Hub) connectionCanSend(c *connection) bool {
+	if c.isMember() {
+		if h.isCurrentMember(c) {
+			return true
+		}
+		_ = c.close(websocket.StatusPolicyViolation, "connection superseded")
+		return false
+	}
+
+	if h.registry.PendingExists(c.channelID, c.deviceID, c.joinRequestID) {
+		if h.isCurrentPending(c) {
+			return true
+		}
+		_ = c.close(websocket.StatusPolicyViolation, "connection superseded")
+		return false
+	}
+
+	if h.registryMemberExists(c.channelID, c.deviceID) && (h.isCurrentPending(c) || h.isCurrentMember(c)) {
+		return true
+	}
+
+	h.removePending(c)
+	_ = c.close(websocket.StatusPolicyViolation, "join request is no longer pending")
+	return false
+}
+
+func (h *Hub) registryMemberExists(channelID, deviceID string) bool {
+	ch := h.registry.Channel(channelID)
+	if ch == nil {
+		return false
+	}
+	_, ok := ch.Members[deviceID]
+	return ok
+}
+
+func (h *Hub) register(c *connection) *connection {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -411,10 +457,19 @@ func (h *Hub) register(c *connection) {
 		if h.members[c.channelID] == nil {
 			h.members[c.channelID] = make(map[string]*connection)
 		}
+		previous := h.members[c.channelID][c.deviceID]
 		h.members[c.channelID][c.deviceID] = c
-		return
+		if previous != c {
+			return previous
+		}
+		return nil
 	}
+	previous := h.pending[c.joinRequestID]
 	h.pending[c.joinRequestID] = c
+	if previous != c {
+		return previous
+	}
+	return nil
 }
 
 func (h *Hub) unregister(c *connection) {
@@ -439,20 +494,49 @@ func (h *Hub) unregister(c *connection) {
 	}
 }
 
-func (h *Hub) promotePending(c *connection) {
+func (h *Hub) removePending(c *connection) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
 	if current := h.pending[c.joinRequestID]; current == c {
 		delete(h.pending, c.joinRequestID)
 	}
-	c.mu.Lock()
-	c.role = auth.RoleMember
-	c.mu.Unlock()
+}
+
+func (h *Hub) promotePending(c *connection) *connection {
+	h.mu.Lock()
+	if current := h.pending[c.joinRequestID]; current == c {
+		delete(h.pending, c.joinRequestID)
+	}
 	if h.members[c.channelID] == nil {
 		h.members[c.channelID] = make(map[string]*connection)
 	}
+	previous := h.members[c.channelID][c.deviceID]
 	h.members[c.channelID][c.deviceID] = c
+	h.mu.Unlock()
+
+	c.mu.Lock()
+	c.role = auth.RoleMember
+	c.mu.Unlock()
+
+	if previous != c {
+		return previous
+	}
+	return nil
+}
+
+func (h *Hub) isCurrentMember(c *connection) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.members[c.channelID] == nil {
+		return false
+	}
+	return h.members[c.channelID][c.deviceID] == c
+}
+
+func (h *Hub) isCurrentPending(c *connection) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.pending[c.joinRequestID] == c
 }
 
 func (h *Hub) memberConnection(channelID, deviceID string) *connection {
@@ -514,6 +598,12 @@ func (c *connection) writeEvent(event protocol.Event) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.conn.Write(ctx, websocket.MessageText, data)
+}
+
+func (c *connection) close(code websocket.StatusCode, reason string) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.Close(code, reason)
 }
 
 func (c *connection) sendError(code, message, replyTo string) {
