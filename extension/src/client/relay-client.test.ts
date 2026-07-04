@@ -145,8 +145,8 @@ describe("RelayClient", () => {
     client.ask("dev_2", "question?");
     socket?.emitMessage({ id: "ask_in", type: RelayEventType.MessageSend, from: "dev_2", to: "dev_1", payload: { text: "remote question?", kind: "ask" } });
     client.reply("ask_in", "answer");
-    client.approveJoin("join_1");
-    client.denyJoin("join_2");
+    client.approve("join_1");
+    client.deny("join_2");
     client.list();
     client.status();
 

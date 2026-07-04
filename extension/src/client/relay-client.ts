@@ -225,18 +225,26 @@ export class RelayClient {
     }) as RelayEvent<MessagePayload>;
   }
 
-  approveJoin(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
+  approve(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
     return this.sendEvent({
       type: RelayEventType.JoinApprove,
       payload: { joinRequestId },
     }) as RelayEvent<JoinDecisionPayload>;
   }
 
-  denyJoin(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
+  deny(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
     return this.sendEvent({
       type: RelayEventType.JoinDeny,
       payload: { joinRequestId },
     }) as RelayEvent<JoinDecisionPayload>;
+  }
+
+  approveJoin(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
+    return this.approve(joinRequestId);
+  }
+
+  denyJoin(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
+    return this.deny(joinRequestId);
   }
 
   list(): RelayEvent {
