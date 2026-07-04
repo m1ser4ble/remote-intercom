@@ -29,6 +29,7 @@ type Registry struct {
 type Channel struct {
 	ID             string
 	Name           string
+	key            string
 	Members        map[string]Member
 	PendingJoins   map[string]JoinRequest
 	CurrentOwnerID string
@@ -55,6 +56,14 @@ type ConnectResult struct {
 	JoinRequest *JoinRequest
 }
 
+type PresenceChange struct {
+	Channel         *Channel
+	PreviousOwnerID string
+	CurrentOwnerID  string
+	Deleted         bool
+	Changed         bool
+}
+
 func NewRegistry() *Registry {
 	return &Registry{
 		channels:     make(map[string]*Channel),
@@ -71,13 +80,13 @@ func (r *Registry) Connect(channelName, pin, deviceID, deviceName string) Connec
 
 	channelID, ok := r.channelByKey[key]
 	if !ok {
-		member := Member{DeviceID: deviceID, DeviceName: deviceName, Online: true, Priority: 1}
+		member := Member{DeviceID: deviceID, DeviceName: deviceName, Online: false, Priority: 1}
 		ch := &Channel{
-			ID:             channelIDForKey(key),
-			Name:           normalizedName,
-			Members:        map[string]Member{deviceID: member},
-			PendingJoins:   make(map[string]JoinRequest),
-			CurrentOwnerID: deviceID,
+			ID:           channelIDForKey(key),
+			Name:         normalizedName,
+			key:          key,
+			Members:      map[string]Member{deviceID: member},
+			PendingJoins: make(map[string]JoinRequest),
 		}
 		r.channels[ch.ID] = ch
 		r.channelByKey[key] = ch.ID
@@ -87,7 +96,6 @@ func (r *Registry) Connect(channelName, pin, deviceID, deviceName string) Connec
 	ch := r.channels[channelID]
 	if member, ok := ch.Members[deviceID]; ok {
 		member.DeviceName = deviceName
-		member.Online = true
 		ch.Members[deviceID] = member
 		recomputeOwner(ch)
 		return ConnectResult{Status: StatusConnected, Channel: snapshotChannel(ch), Member: copyMember(member)}
@@ -170,21 +178,57 @@ func (r *Registry) PendingExists(channelID, deviceID, joinRequestID string) bool
 }
 
 func (r *Registry) SetOnline(channelID, deviceID string, online bool) error {
+	_, err := r.SetOnlineWithChange(channelID, deviceID, online)
+	return err
+}
+
+func (r *Registry) SetOnlineWithChange(channelID, deviceID string, online bool) (*PresenceChange, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	ch, ok := r.channels[channelID]
 	if !ok {
-		return fmt.Errorf("channel %q not found", channelID)
+		return nil, fmt.Errorf("channel %q not found", channelID)
 	}
+	return r.setOnlineLocked(ch, deviceID, online, false)
+}
+
+func (r *Registry) ExpireOfflineMember(channelID, deviceID string) (*PresenceChange, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ch, ok := r.channels[channelID]
+	if !ok {
+		return nil, fmt.Errorf("channel %q not found", channelID)
+	}
+	return r.setOnlineLocked(ch, deviceID, false, true)
+}
+
+func (r *Registry) setOnlineLocked(ch *Channel, deviceID string, online, deleteIfEmpty bool) (*PresenceChange, error) {
 	member, ok := ch.Members[deviceID]
 	if !ok {
-		return fmt.Errorf("member %q not found", deviceID)
+		return nil, fmt.Errorf("member %q not found", deviceID)
 	}
+	previousOwnerID := ch.CurrentOwnerID
+	previousOnline := member.Online
 	member.Online = online
 	ch.Members[deviceID] = member
 	recomputeOwner(ch)
-	return nil
+
+	change := &PresenceChange{
+		Channel:         snapshotChannel(ch),
+		PreviousOwnerID: previousOwnerID,
+		CurrentOwnerID:  ch.CurrentOwnerID,
+		Changed:         previousOnline != online || previousOwnerID != ch.CurrentOwnerID,
+	}
+	if deleteIfEmpty && ch.CurrentOwnerID == "" {
+		delete(r.channels, ch.ID)
+		delete(r.channelByKey, ch.key)
+		change.Channel = nil
+		change.Deleted = true
+		change.Changed = true
+	}
+	return change, nil
 }
 
 func (r *Registry) Channel(channelID string) *Channel {
@@ -231,7 +275,7 @@ func approveLocked(ch *Channel, joinRequestID string) error {
 	ch.Members[join.DeviceID] = Member{
 		DeviceID:   join.DeviceID,
 		DeviceName: join.DeviceName,
-		Online:     true,
+		Online:     false,
 		Priority:   nextPriority(ch),
 	}
 	deletePendingJoinsForDevice(ch, join.DeviceID)
@@ -304,6 +348,7 @@ func snapshotChannel(ch *Channel) *Channel {
 	return &Channel{
 		ID:             ch.ID,
 		Name:           ch.Name,
+		key:            ch.key,
 		Members:        members,
 		PendingJoins:   pending,
 		CurrentOwnerID: ch.CurrentOwnerID,

@@ -125,7 +125,7 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 			"text": "approved",
 		},
 	})
-	reply := readUntil(t, aliceWS, "message.send", func(event protocol.Event) bool { return event.ID == "reply-1" })
+	reply := readUntil(t, aliceWS, "message.send", func(event protocol.Event) bool { return event.ID == "reply-1" }, "presence.changed", "owner.changed")
 	assertMessage(t, reply, alice.ChannelID, "dev_bob", "dev_alice", "reply", "approved", "ask-1")
 
 	if err := aliceWS.Close(websocket.StatusNormalClosure, "e2e disconnect alice"); err != nil {
@@ -163,6 +163,7 @@ func newRelayFixture(t *testing.T) relayFixture {
 	}
 	registry := channel.NewRegistry()
 	relay := httpapi.NewServer(registry, tokens, "0.1.0")
+	relay.Hub.SetReconnectGrace(25 * time.Millisecond)
 	server := httptest.NewServer(relay.Routes())
 	t.Cleanup(server.Close)
 	return relayFixture{server: server, registry: registry}
@@ -285,7 +286,7 @@ func waitForOwner(t *testing.T, conn *websocket.Conn, channelID, deviceID, joinR
 		writeEvent(t, conn, protocol.Event{ID: eventID, Type: "status.request"})
 		status := readUntil(t, conn, "status.response", func(event protocol.Event) bool {
 			return event.ReplyTo == eventID
-		})
+		}, "presence.changed", "owner.changed")
 		assertStatusResponse(t, status, channelID, deviceID, joinRequestID)
 		lastOwnerID = stringPayload(t, status.Payload, "ownerId")
 		if lastOwnerID == wantOwnerID {

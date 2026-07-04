@@ -19,7 +19,7 @@ import (
 )
 
 func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
-	server := newRelayServer(t)
+	server := newRelayFixture(t, 50*time.Millisecond).server
 
 	alice := postConnect(t, server, protocol.ConnectRequest{
 		ChannelName: "ops",
@@ -37,10 +37,7 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	})
 	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
 
-	joinRequest := readEvent(t, aliceWS)
-	if joinRequest.Type != "join.request" {
-		t.Fatalf("event type = %q, want join.request", joinRequest.Type)
-	}
+	joinRequest := readEventOfType(t, aliceWS, "join.request", nil)
 	if joinRequest.From != "dev_bob" || joinRequest.To != "dev_alice" {
 		t.Fatalf("join request route = %s -> %s, want dev_bob -> dev_alice", joinRequest.From, joinRequest.To)
 	}
@@ -73,10 +70,7 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 		},
 	})
 
-	fromJoinedMember := readEvent(t, aliceWS)
-	if fromJoinedMember.Type != "message.send" {
-		t.Fatalf("event type = %q, want message.send", fromJoinedMember.Type)
-	}
+	fromJoinedMember := readEventOfType(t, aliceWS, "message.send", func(event protocol.Event) bool { return event.ID == "send-joined" })
 	if fromJoinedMember.From != "dev_bob" || fromJoinedMember.To != "dev_alice" {
 		t.Fatalf("joined member route = %s -> %s, want dev_bob -> dev_alice", fromJoinedMember.From, fromJoinedMember.To)
 	}
@@ -125,13 +119,13 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 }
 
 func TestPendingConnectionCannotRouteMessages(t *testing.T) {
-	server := newRelayServer(t)
+	server := newRelayFixture(t, 50*time.Millisecond).server
 
 	alice := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
 	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
 	bob := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
 	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
-	_ = readEvent(t, aliceWS) // join.request
+	_ = readEventOfType(t, aliceWS, "join.request", nil)
 
 	writeEvent(t, bobWS, protocol.Event{ID: "send-pending", Type: "message.send", To: "dev_alice"})
 
@@ -145,13 +139,13 @@ func TestPendingConnectionCannotRouteMessages(t *testing.T) {
 }
 
 func TestDeniedPendingConnectionReceivesDeniedThenCloses(t *testing.T) {
-	server := newRelayServer(t)
+	server := newRelayFixture(t, 50*time.Millisecond).server
 
 	alice := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
 	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
 	bob := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
 	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
-	_ = readEvent(t, aliceWS) // join.request
+	_ = readEventOfType(t, aliceWS, "join.request", nil)
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "deny-1",
@@ -176,13 +170,13 @@ func TestDeniedPendingConnectionReceivesDeniedThenCloses(t *testing.T) {
 }
 
 func TestDuplicateMemberConnectionRevokesOldConnection(t *testing.T) {
-	server := newRelayServer(t)
+	server := newRelayFixture(t, 50*time.Millisecond).server
 
 	alice := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
 	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
 	bob := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
 	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
-	_ = readEvent(t, aliceWS) // join.request
+	_ = readEventOfType(t, aliceWS, "join.request", nil)
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "approve-1",
@@ -195,6 +189,9 @@ func TestDuplicateMemberConnectionRevokesOldConnection(t *testing.T) {
 	if approved.Type != "join.approved" {
 		t.Fatalf("event type = %q, want join.approved", approved.Type)
 	}
+	_ = readEventOfType(t, aliceWS, "presence.changed", func(event protocol.Event) bool {
+		return stringPayload(t, event.Payload, "deviceId") == "dev_bob"
+	})
 
 	reconnected := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice-new", DeviceID: "dev_alice"})
 	if reconnected.Status != string(channel.StatusConnected) {
@@ -216,8 +213,104 @@ func TestDuplicateMemberConnectionRevokesOldConnection(t *testing.T) {
 	assertNoEvent(t, bobWS, 200*time.Millisecond)
 }
 
+func TestLastMemberDisconnectGraceDeletesChannel(t *testing.T) {
+	fixture := newRelayFixture(t, 25*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+
+	if err := aliceWS.Close(websocket.StatusNormalClosure, "disconnect alice"); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, func() bool { return fixture.registry.Channel(alice.ChannelID) == nil })
+
+	fresh := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	if fresh.Status != string(channel.StatusCreated) {
+		t.Fatalf("fresh status = %q, want %q", fresh.Status, channel.StatusCreated)
+	}
+}
+
+func TestHTTPConnectWithoutWebSocketDoesNotCreateOnlineOwner(t *testing.T) {
+	fixture := newRelayFixture(t, 25*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+
+	ch := fixture.registry.Channel(alice.ChannelID)
+	if ch == nil {
+		t.Fatal("channel missing")
+	}
+	if ch.CurrentOwnerID != "" {
+		t.Fatalf("owner = %q, want empty before websocket connects", ch.CurrentOwnerID)
+	}
+	if ch.Members["dev_alice"].Online {
+		t.Fatal("HTTP-only member is online")
+	}
+}
+
+func TestOwnerDisconnectResendsPendingJoinToFailoverOwner(t *testing.T) {
+	fixture := newRelayFixture(t, 25*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+	bob := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
+	_ = readEventOfType(t, aliceWS, "join.request", func(event protocol.Event) bool { return event.From == "dev_bob" })
+
+	writeEvent(t, aliceWS, protocol.Event{ID: "approve-bob", Type: "join.approve", Payload: map[string]any{"joinRequestId": bob.JoinRequestID}})
+	_ = readEventOfType(t, bobWS, "join.approved", func(event protocol.Event) bool { return event.ReplyTo == "approve-bob" })
+	_ = readEventOfType(t, aliceWS, "presence.changed", func(event protocol.Event) bool {
+		return stringPayload(t, event.Payload, "deviceId") == "dev_bob"
+	})
+
+	carol := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "carol", DeviceID: "dev_carol"})
+	carolWS := dialWSWithTokenQuery(t, carol.WSURL, carol.Token)
+	_ = carolWS
+	_ = readEventOfType(t, aliceWS, "join.request", func(event protocol.Event) bool { return event.From == "dev_carol" })
+
+	if err := aliceWS.Close(websocket.StatusNormalClosure, "disconnect owner"); err != nil {
+		t.Fatal(err)
+	}
+	resent := readEventOfType(t, bobWS, "join.request", func(event protocol.Event) bool { return event.From == "dev_carol" })
+	if got := stringPayload(t, resent.Payload, "joinRequestId"); got != carol.JoinRequestID {
+		t.Fatalf("resent joinRequestId = %q, want %q", got, carol.JoinRequestID)
+	}
+}
+
+func TestOriginalOwnerReconnectRestoresOwner(t *testing.T) {
+	fixture := newRelayFixture(t, 25*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+	bob := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
+	_ = readEventOfType(t, aliceWS, "join.request", nil)
+	writeEvent(t, aliceWS, protocol.Event{ID: "approve-bob", Type: "join.approve", Payload: map[string]any{"joinRequestId": bob.JoinRequestID}})
+	_ = readEventOfType(t, bobWS, "join.approved", nil)
+	_ = readEventOfType(t, aliceWS, "presence.changed", nil)
+
+	if err := aliceWS.Close(websocket.StatusNormalClosure, "disconnect alice"); err != nil {
+		t.Fatal(err)
+	}
+	_ = readEventOfType(t, bobWS, "owner.changed", func(event protocol.Event) bool {
+		return stringPayload(t, event.Payload, "ownerId") == "dev_bob"
+	})
+
+	carol := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "carol", DeviceID: "dev_carol"})
+	carolWS := dialWSWithTokenQuery(t, carol.WSURL, carol.Token)
+	_ = carolWS
+	_ = readEventOfType(t, bobWS, "join.request", func(event protocol.Event) bool { return event.From == "dev_carol" })
+
+	reconnected := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice-reconnected", DeviceID: "dev_alice"})
+	reconnectedAliceWS := dialWSWithTokenQuery(t, reconnected.WSURL, reconnected.Token)
+	resent := readEventOfType(t, reconnectedAliceWS, "join.request", func(event protocol.Event) bool { return event.From == "dev_carol" })
+	if got := stringPayload(t, resent.Payload, "joinRequestId"); got != carol.JoinRequestID {
+		t.Fatalf("reconnected owner joinRequestId = %q, want %q", got, carol.JoinRequestID)
+	}
+	writeEvent(t, reconnectedAliceWS, protocol.Event{ID: "status-after-reconnect", Type: "status.request"})
+	status := readEventOfType(t, reconnectedAliceWS, "status.response", func(event protocol.Event) bool { return event.ReplyTo == "status-after-reconnect" })
+	if got := stringPayload(t, status.Payload, "ownerId"); got != "dev_alice" {
+		t.Fatalf("owner after reconnect = %q, want dev_alice", got)
+	}
+}
+
 func TestWebSocketRejectsInvalidToken(t *testing.T) {
-	server := newRelayServer(t)
+	server := newRelayFixture(t, 50*time.Millisecond).server
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -234,15 +327,24 @@ func TestWebSocketRejectsInvalidToken(t *testing.T) {
 	}
 }
 
-func newRelayServer(t *testing.T) *httptest.Server {
+type relayFixture struct {
+	server   *httptest.Server
+	registry *channel.Registry
+	relay    *httpapi.Server
+}
+
+func newRelayFixture(t *testing.T, reconnectGrace time.Duration) relayFixture {
 	t.Helper()
 	tokens, err := auth.NewTokenManager([]byte("01234567890123456789012345678901"), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(httpapi.NewServer(channel.NewRegistry(), tokens, "0.1.0").Routes())
+	registry := channel.NewRegistry()
+	relay := httpapi.NewServer(registry, tokens, "0.1.0")
+	relay.Hub.SetReconnectGrace(reconnectGrace)
+	server := httptest.NewServer(relay.Routes())
 	t.Cleanup(server.Close)
-	return server
+	return relayFixture{server: server, registry: registry, relay: relay}
 }
 
 func postConnect(t *testing.T, server *httptest.Server, request protocol.ConnectRequest) protocol.ConnectResponse {
@@ -313,6 +415,38 @@ func readEvent(t *testing.T, conn *websocket.Conn) protocol.Event {
 	return event
 }
 
+func readEventOfType(t *testing.T, conn *websocket.Conn, eventType string, match func(protocol.Event) bool) protocol.Event {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
+		messageType, data, err := conn.Read(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("read websocket event while waiting for %s: %v", eventType, err)
+		}
+		if messageType != websocket.MessageText {
+			t.Fatalf("message type = %v, want text", messageType)
+		}
+		var event protocol.Event
+		if err := json.Unmarshal(data, &event); err != nil {
+			t.Fatalf("invalid event JSON %q: %v", string(data), err)
+		}
+		if event.Type != eventType {
+			continue
+		}
+		if match == nil || match(event) {
+			return event
+		}
+	}
+	t.Fatalf("timed out waiting for websocket event type %s", eventType)
+	return protocol.Event{}
+}
+
 func writeEvent(t *testing.T, conn *websocket.Conn, event protocol.Event) {
 	t.Helper()
 	if err := writeEventMaybe(conn, event); err != nil {
@@ -355,6 +489,18 @@ func assertNoEvent(t *testing.T, conn *websocket.Conn, duration time.Duration) {
 		t.Fatalf("unexpected read error while waiting for no event: %v", err)
 	}
 	t.Fatalf("unexpected message type %v: %s", messageType, string(data))
+}
+
+func waitForCondition(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before deadline")
 }
 
 func stringPayload(t *testing.T, payload map[string]any, key string) string {

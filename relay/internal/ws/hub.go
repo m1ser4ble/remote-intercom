@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	writeTimeout     = 5 * time.Second
-	heartbeatEvery   = 30 * time.Second
-	heartbeatTimeout = 5 * time.Second
+	writeTimeout          = 5 * time.Second
+	heartbeatEvery        = 30 * time.Second
+	heartbeatTimeout      = 5 * time.Second
+	defaultReconnectGrace = 30 * time.Second
 )
 
 // Hub manages live WebSocket connections and routes relay protocol events.
@@ -26,19 +27,31 @@ type Hub struct {
 	registry *channel.Registry
 	tokens   *auth.TokenManager
 
-	mu      sync.RWMutex
-	members map[string]map[string]*connection // channelID -> deviceID -> connection
-	pending map[string]*connection            // joinRequestID -> connection
+	mu             sync.RWMutex
+	members        map[string]map[string]*connection // channelID -> deviceID -> connection
+	pending        map[string]*connection            // joinRequestID -> connection
+	offlineTimers  map[string]map[string]*time.Timer // channelID -> deviceID -> timer
+	reconnectGrace time.Duration
 }
 
 // NewHub returns a WebSocket hub backed by the shared channel registry and token manager.
 func NewHub(registry *channel.Registry, tokens *auth.TokenManager) *Hub {
 	return &Hub{
-		registry: registry,
-		tokens:   tokens,
-		members:  make(map[string]map[string]*connection),
-		pending:  make(map[string]*connection),
+		registry:       registry,
+		tokens:         tokens,
+		members:        make(map[string]map[string]*connection),
+		pending:        make(map[string]*connection),
+		offlineTimers:  make(map[string]map[string]*time.Timer),
+		reconnectGrace: defaultReconnectGrace,
 	}
+}
+
+// SetReconnectGrace configures the member reconnect grace period. It is intended
+// for tests and local deployments that need faster ephemeral-channel cleanup.
+func (h *Hub) SetReconnectGrace(duration time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.reconnectGrace = duration
 }
 
 // ServeHTTP authenticates and accepts a WebSocket connection.
@@ -76,14 +89,19 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		joinRequestID: claims.JoinRequestID,
 	}
 
+	previous := h.register(client)
 	if client.role == auth.RoleMember {
-		if err := h.registry.SetOnline(client.channelID, client.deviceID, true); err != nil {
+		change, err := h.registry.SetOnlineWithChange(client.channelID, client.deviceID, true)
+		if err != nil {
+			h.unregister(client)
 			_ = conn.Close(websocket.StatusPolicyViolation, "member is not registered")
 			return
 		}
+		h.emitPresenceChange(change, client.deviceID)
+		if change.Channel != nil && change.PreviousOwnerID == change.CurrentOwnerID && change.CurrentOwnerID == client.deviceID {
+			h.notifyOwnerOfPendingJoins(change.Channel)
+		}
 	}
-
-	previous := h.register(client)
 	if previous != nil {
 		_ = previous.close(websocket.StatusPolicyViolation, "connection superseded")
 	}
@@ -280,9 +298,16 @@ func (h *Hub) handleJoinDecision(c *connection, event protocol.Event, approve bo
 
 	if approve {
 		previous := h.promotePending(pendingConn)
+		change, err := h.registry.SetOnlineWithChange(pendingConn.channelID, pendingConn.deviceID, true)
+		if err != nil {
+			h.removeMember(pendingConn)
+			pendingConn.sendError("invalid_event", err.Error(), event.ID)
+			return
+		}
 		if previous != nil {
 			_ = previous.close(websocket.StatusPolicyViolation, "connection superseded")
 		}
+		h.emitPresenceChange(change, pendingConn.deviceID)
 		_ = pendingConn.writeEvent(protocol.Event{
 			Type:      "join.approved",
 			ChannelID: c.channelID,
@@ -397,14 +422,27 @@ func (h *Hub) notifyOwnerOfJoin(c *connection) {
 	if !ok {
 		return
 	}
-	owner := h.memberConnection(c.channelID, ch.CurrentOwnerID)
+	h.notifyOwnerOfJoinRequest(ch, join)
+}
+
+func (h *Hub) notifyOwnerOfPendingJoins(ch *channel.Channel) {
+	if ch == nil || ch.CurrentOwnerID == "" {
+		return
+	}
+	for _, join := range ch.PendingJoins {
+		h.notifyOwnerOfJoinRequest(ch, join)
+	}
+}
+
+func (h *Hub) notifyOwnerOfJoinRequest(ch *channel.Channel, join channel.JoinRequest) {
+	owner := h.memberConnection(ch.ID, ch.CurrentOwnerID)
 	if owner == nil {
 		return
 	}
 	_ = owner.writeEvent(protocol.Event{
 		Type:      "join.request",
-		ChannelID: c.channelID,
-		From:      c.deviceID,
+		ChannelID: ch.ID,
+		From:      join.DeviceID,
 		To:        owner.deviceID,
 		Payload: map[string]any{
 			"joinRequestId": join.ID,
@@ -412,6 +450,57 @@ func (h *Hub) notifyOwnerOfJoin(c *connection) {
 			"deviceName":    join.DeviceName,
 		},
 	})
+}
+
+func (h *Hub) emitPresenceChange(change *channel.PresenceChange, deviceID string) {
+	if change == nil || change.Deleted || change.Channel == nil || !change.Changed {
+		return
+	}
+	if change.PreviousOwnerID != change.CurrentOwnerID {
+		h.broadcastOwnerChanged(change.Channel, change.PreviousOwnerID, change.CurrentOwnerID, deviceID)
+		h.notifyOwnerOfPendingJoins(change.Channel)
+	}
+	h.broadcastPresenceChanged(change.Channel, deviceID)
+}
+
+func (h *Hub) broadcastOwnerChanged(ch *channel.Channel, previousOwnerID, currentOwnerID, excludeDeviceID string) {
+	for _, target := range h.memberConnections(ch.ID) {
+		if target.deviceID == excludeDeviceID {
+			continue
+		}
+		_ = target.writeEvent(protocol.Event{
+			Type:      "owner.changed",
+			ChannelID: ch.ID,
+			To:        target.deviceID,
+			Payload: map[string]any{
+				"previousOwnerId": previousOwnerID,
+				"ownerId":         currentOwnerID,
+			},
+		})
+	}
+}
+
+func (h *Hub) broadcastPresenceChanged(ch *channel.Channel, deviceID string) {
+	member, ok := ch.Members[deviceID]
+	if !ok {
+		return
+	}
+	for _, target := range h.memberConnections(ch.ID) {
+		if target.deviceID == deviceID {
+			continue
+		}
+		_ = target.writeEvent(protocol.Event{
+			Type:      "presence.changed",
+			ChannelID: ch.ID,
+			To:        target.deviceID,
+			Payload: map[string]any{
+				"deviceId":   member.DeviceID,
+				"deviceName": member.DeviceName,
+				"online":     member.Online,
+				"ownerId":    ch.CurrentOwnerID,
+			},
+		})
+	}
 }
 
 func (h *Hub) connectionCanSend(c *connection) bool {
@@ -454,6 +543,7 @@ func (h *Hub) register(c *connection) *connection {
 	defer h.mu.Unlock()
 
 	if c.role == auth.RoleMember {
+		h.cancelOfflineTimerLocked(c.channelID, c.deviceID)
 		if h.members[c.channelID] == nil {
 			h.members[c.channelID] = make(map[string]*connection)
 		}
@@ -487,11 +577,10 @@ func (h *Hub) unregister(c *connection) {
 			}
 		}
 	}
-	h.mu.Unlock()
-
 	if removedMember {
-		_ = h.registry.SetOnline(c.channelID, c.deviceID, false)
+		h.startOfflineTimerLocked(c.channelID, c.deviceID)
 	}
+	h.mu.Unlock()
 }
 
 func (h *Hub) removePending(c *connection) {
@@ -502,11 +591,25 @@ func (h *Hub) removePending(c *connection) {
 	}
 }
 
+func (h *Hub) removeMember(c *connection) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if channelMembers := h.members[c.channelID]; channelMembers != nil {
+		if current := channelMembers[c.deviceID]; current == c {
+			delete(channelMembers, c.deviceID)
+			if len(channelMembers) == 0 {
+				delete(h.members, c.channelID)
+			}
+		}
+	}
+}
+
 func (h *Hub) promotePending(c *connection) *connection {
 	h.mu.Lock()
 	if current := h.pending[c.joinRequestID]; current == c {
 		delete(h.pending, c.joinRequestID)
 	}
+	h.cancelOfflineTimerLocked(c.channelID, c.deviceID)
 	if h.members[c.channelID] == nil {
 		h.members[c.channelID] = make(map[string]*connection)
 	}
@@ -522,6 +625,56 @@ func (h *Hub) promotePending(c *connection) *connection {
 		return previous
 	}
 	return nil
+}
+
+func (h *Hub) startOfflineTimerLocked(channelID, deviceID string) {
+	h.cancelOfflineTimerLocked(channelID, deviceID)
+	grace := h.reconnectGrace
+	if h.offlineTimers[channelID] == nil {
+		h.offlineTimers[channelID] = make(map[string]*time.Timer)
+	}
+	h.offlineTimers[channelID][deviceID] = time.AfterFunc(grace, func() {
+		h.expireOfflineMember(channelID, deviceID)
+	})
+}
+
+func (h *Hub) cancelOfflineTimerLocked(channelID, deviceID string) {
+	channelTimers := h.offlineTimers[channelID]
+	if channelTimers == nil {
+		return
+	}
+	if timer := channelTimers[deviceID]; timer != nil {
+		timer.Stop()
+		delete(channelTimers, deviceID)
+	}
+	if len(channelTimers) == 0 {
+		delete(h.offlineTimers, channelID)
+	}
+}
+
+func (h *Hub) expireOfflineMember(channelID, deviceID string) {
+	h.mu.Lock()
+	if channelTimers := h.offlineTimers[channelID]; channelTimers != nil {
+		delete(channelTimers, deviceID)
+		if len(channelTimers) == 0 {
+			delete(h.offlineTimers, channelID)
+		}
+	}
+	if channelMembers := h.members[channelID]; channelMembers != nil && channelMembers[deviceID] != nil {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+
+	change, err := h.registry.ExpireOfflineMember(channelID, deviceID)
+	if err != nil {
+		return
+	}
+	if change.Deleted {
+		h.closePendingForChannel(channelID)
+		return
+	}
+	h.emitPresenceChange(change, deviceID)
 }
 
 func (h *Hub) isCurrentMember(c *connection) bool {
@@ -566,6 +719,22 @@ func (h *Hub) pendingConnection(joinRequestID string) *connection {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.pending[joinRequestID]
+}
+
+func (h *Hub) closePendingForChannel(channelID string) {
+	h.mu.Lock()
+	var pending []*connection
+	for joinRequestID, conn := range h.pending {
+		if conn.channelID == channelID {
+			pending = append(pending, conn)
+			delete(h.pending, joinRequestID)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, conn := range pending {
+		_ = conn.close(websocket.StatusPolicyViolation, "channel deleted")
+	}
 }
 
 type connection struct {

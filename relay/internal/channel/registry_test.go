@@ -2,14 +2,17 @@ package channel
 
 import "testing"
 
-func TestFirstConnectCreatesChannelAndOwner(t *testing.T) {
+func TestFirstConnectCreatesOfflineChannelMember(t *testing.T) {
 	r := NewRegistry()
 	res := r.Connect("dwkim", "1234", "dev_a", "macbook")
 	if res.Status != StatusCreated {
 		t.Fatalf("status = %s", res.Status)
 	}
-	if res.Channel.CurrentOwnerID != "dev_a" {
-		t.Fatalf("owner = %s", res.Channel.CurrentOwnerID)
+	if res.Channel.CurrentOwnerID != "" {
+		t.Fatalf("owner = %s, want empty until websocket connects", res.Channel.CurrentOwnerID)
+	}
+	if res.Member == nil || res.Member.Online {
+		t.Fatalf("member = %+v, want offline until websocket connects", res.Member)
 	}
 }
 
@@ -25,7 +28,7 @@ func TestSecondConnectCreatesPendingJoin(t *testing.T) {
 	}
 }
 
-func TestApproveJoinAddsMember(t *testing.T) {
+func TestApproveJoinAddsOfflineMember(t *testing.T) {
 	r := NewRegistry()
 	r.Connect("dwkim", "1234", "dev_a", "macbook")
 	pending := r.Connect("dwkim", "1234", "dev_b", "mini")
@@ -33,8 +36,12 @@ func TestApproveJoinAddsMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	ch := r.Channel(pending.Channel.ID)
-	if _, ok := ch.Members["dev_b"]; !ok {
+	member, ok := ch.Members["dev_b"]
+	if !ok {
 		t.Fatal("dev_b not admitted")
+	}
+	if member.Online {
+		t.Fatal("approved member should remain offline until websocket connects")
 	}
 }
 
@@ -113,9 +120,15 @@ func TestApproveStaleJoinForExistingMemberReturnsErrorWithoutMutation(t *testing
 
 func TestOwnerFailoverAndRestore(t *testing.T) {
 	r := NewRegistry()
-	r.Connect("dwkim", "1234", "dev_a", "macbook")
+	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	if err := r.SetOnline(created.Channel.ID, "dev_a", true); err != nil {
+		t.Fatal(err)
+	}
 	pending := r.Connect("dwkim", "1234", "dev_b", "mini")
 	_ = r.Approve(pending.Channel.ID, pending.JoinRequest.ID)
+	if err := r.SetOnline(pending.Channel.ID, "dev_b", true); err != nil {
+		t.Fatal(err)
+	}
 	r.SetOnline(pending.Channel.ID, "dev_a", false)
 	if got := r.Channel(pending.Channel.ID).CurrentOwnerID; got != "dev_b" {
 		t.Fatalf("owner = %s", got)
@@ -129,8 +142,14 @@ func TestOwnerFailoverAndRestore(t *testing.T) {
 func TestStaleOwnerCannotApproveAfterFailover(t *testing.T) {
 	r := NewRegistry()
 	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	if err := r.SetOnline(created.Channel.ID, "dev_a", true); err != nil {
+		t.Fatal(err)
+	}
 	member := r.Connect("dwkim", "1234", "dev_b", "mini")
 	if err := r.Approve(created.Channel.ID, member.JoinRequest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetOnline(created.Channel.ID, "dev_b", true); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.SetOnline(created.Channel.ID, "dev_a", false); err != nil {
@@ -153,8 +172,14 @@ func TestStaleOwnerCannotApproveAfterFailover(t *testing.T) {
 func TestStaleOwnerCannotDenyAfterFailover(t *testing.T) {
 	r := NewRegistry()
 	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	if err := r.SetOnline(created.Channel.ID, "dev_a", true); err != nil {
+		t.Fatal(err)
+	}
 	member := r.Connect("dwkim", "1234", "dev_b", "mini")
 	if err := r.Approve(created.Channel.ID, member.JoinRequest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetOnline(created.Channel.ID, "dev_b", true); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.SetOnline(created.Channel.ID, "dev_a", false); err != nil {
@@ -187,11 +212,17 @@ func TestDenyRemovesPendingJoin(t *testing.T) {
 	}
 }
 
-func TestReconnectAdmittedDeviceRestoresOwner(t *testing.T) {
+func TestReconnectAdmittedDeviceRestoresOwnerWhenWebSocketConnects(t *testing.T) {
 	r := NewRegistry()
 	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	if err := r.SetOnline(created.Channel.ID, "dev_a", true); err != nil {
+		t.Fatal(err)
+	}
 	pending := r.Connect("dwkim", "1234", "dev_b", "mini")
 	_ = r.Approve(pending.Channel.ID, pending.JoinRequest.ID)
+	if err := r.SetOnline(created.Channel.ID, "dev_b", true); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.SetOnline(created.Channel.ID, "dev_a", false); err != nil {
 		t.Fatal(err)
 	}
@@ -199,8 +230,36 @@ func TestReconnectAdmittedDeviceRestoresOwner(t *testing.T) {
 	if res.Status != StatusConnected {
 		t.Fatalf("status = %s", res.Status)
 	}
-	if got := res.Channel.CurrentOwnerID; got != "dev_a" {
-		t.Fatalf("owner = %s", got)
+	if got := res.Channel.CurrentOwnerID; got != "dev_b" {
+		t.Fatalf("owner after HTTP connect = %s, want dev_b", got)
+	}
+	if err := r.SetOnline(created.Channel.ID, "dev_a", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Channel(created.Channel.ID).CurrentOwnerID; got != "dev_a" {
+		t.Fatalf("owner after websocket connect = %s", got)
+	}
+}
+
+func TestExpireLastOfflineMemberDeletesChannelKey(t *testing.T) {
+	r := NewRegistry()
+	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	if err := r.SetOnline(created.Channel.ID, "dev_a", true); err != nil {
+		t.Fatal(err)
+	}
+	change, err := r.ExpireOfflineMember(created.Channel.ID, "dev_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !change.Deleted {
+		t.Fatal("expected channel deletion")
+	}
+	if ch := r.Channel(created.Channel.ID); ch != nil {
+		t.Fatalf("channel remains after deletion: %+v", ch)
+	}
+	fresh := r.Connect("dwkim", "1234", "dev_a", "macbook")
+	if fresh.Status != StatusCreated {
+		t.Fatalf("fresh status = %s, want %s", fresh.Status, StatusCreated)
 	}
 }
 
