@@ -127,6 +127,37 @@ describe("remote intercom tool", () => {
     expect(client.currentStatus).toBe("disconnected");
   });
 
+  it("rejects malformed tool inputs before dispatching to the client", async () => {
+    const client = new MockClient();
+    const tool = createRemoteIntercomTool({ client });
+
+    await expect(tool.execute(null)).rejects.toThrow("remote_intercom input must be a non-null object");
+    await expect(tool.execute({ action: "bogus" })).rejects.toThrow("remote_intercom action must be one of");
+    await expect(tool.execute({ action: "connect", channel: "dwkim" })).rejects.toThrow("connect requires non-empty string field pin");
+    await expect(tool.execute({ action: "connect", channel: " ", channelName: "dwkim", pin: "1234" })).rejects.toThrow(
+      "connect field channel must be a non-empty string when provided",
+    );
+    await expect(tool.execute({ action: "send", message: "hello" })).rejects.toThrow("send requires non-empty string field to");
+    await expect(tool.execute({ action: "ask", to: "dev_2", message: " " })).rejects.toThrow("ask requires non-empty string field message");
+    await expect(tool.execute({ action: "reply", replyTo: "ask_1", message: " " })).rejects.toThrow(
+      "reply requires non-empty string field message",
+    );
+    await expect(tool.execute({ action: "reply", id: " ", message: "yes" })).rejects.toThrow(
+      "reply field id must be a non-empty string when provided",
+    );
+    await expect(tool.execute({ action: "approve_join", joinRequestId: " " })).rejects.toThrow(
+      "approve_join field joinRequestId must be a non-empty string when provided",
+    );
+    await expect(tool.execute({ action: "deny_join" })).rejects.toThrow("deny_join requires one of: joinRequestId, id");
+    await expect(tool.execute({ action: "disconnect", code: "1000" })).rejects.toThrow(
+      "disconnect field code must be a finite number when provided",
+    );
+    await expect(tool.execute({ action: "disconnect", reason: 42 })).rejects.toThrow("disconnect field reason must be a string when provided");
+
+    expect(client.connectCalls).toEqual([]);
+    expect(client.sent).toEqual([]);
+  });
+
   it("stores join requests, notifies the agent, and approves or denies through tool actions", async () => {
     const client = new MockClient();
     const pending = new PendingState();
@@ -145,7 +176,10 @@ describe("remote intercom tool", () => {
       },
     });
 
-    expect(onNotify).toHaveBeenCalledWith("Device Laptop wants to join dwkim. Approve?", expect.objectContaining({ type: RelayEventType.JoinRequest }));
+    expect(onNotify).toHaveBeenCalledWith(
+      "Device Laptop wants to join dwkim (joinRequestId: join_1). Use approve_join or deny_join with joinRequestId \"join_1\".",
+      expect.objectContaining({ type: RelayEventType.JoinRequest }),
+    );
     const pendingResult = await tool.execute({ action: "pending" });
     expect(pendingResult.action).toBe("pending");
     if (pendingResult.action !== "pending") {
@@ -171,6 +205,82 @@ describe("remote intercom tool", () => {
     });
     await tool.execute({ action: "deny_join", id: "join_2" });
     expect(client.sent).toContainEqual(expect.objectContaining({ type: RelayEventType.JoinDeny, payload: { joinRequestId: "join_2" } }));
+  });
+
+  it("ignores malformed join request relay events", async () => {
+    const client = new MockClient();
+    const pending = new PendingState();
+    const onNotify = vi.fn();
+    createRemoteIntercomTool({ client, pending, onNotify });
+
+    const malformedEvents: RelayEvent[] = [
+      { id: "evt_missing_payload", type: RelayEventType.JoinRequest, channelId: "ch_1" },
+      { id: "evt_missing_join", type: RelayEventType.JoinRequest, channelId: "ch_1", payload: { deviceId: "dev_2", deviceName: "Laptop" } },
+      { id: "evt_blank_join", type: RelayEventType.JoinRequest, channelId: "ch_1", payload: { joinRequestId: " ", deviceId: "dev_2", deviceName: "Laptop" } },
+      { id: "evt_missing_device", type: RelayEventType.JoinRequest, channelId: "ch_1", payload: { joinRequestId: "join_1", deviceName: "Laptop" } },
+      { id: "evt_blank_name", type: RelayEventType.JoinRequest, channelId: "ch_1", payload: { joinRequestId: "join_1", deviceId: "dev_2", deviceName: "" } },
+      { id: "evt_missing_channel", type: RelayEventType.JoinRequest, payload: { joinRequestId: "join_1", deviceId: "dev_2", deviceName: "Laptop" } },
+      { id: "evt_blank_channel", type: RelayEventType.JoinRequest, channelId: " ", payload: { joinRequestId: "join_1", deviceId: "dev_2", deviceName: "Laptop" } },
+    ];
+
+    for (const event of malformedEvents) {
+      client.emit(event);
+    }
+
+    expect(pending.listJoinRequests()).toEqual([]);
+    expect(onNotify).not.toHaveBeenCalled();
+  });
+
+  it("reports rejected async notifications without leaving unhandled rejections", async () => {
+    const client = new MockClient();
+    const notificationError = new Error("notify failed");
+    const onNotify = vi.fn().mockRejectedValue(notificationError);
+    const onNotifyError = vi.fn();
+    createRemoteIntercomTool({ client, onNotify, onNotifyError });
+
+    client.emit({
+      id: "ask_1",
+      type: RelayEventType.MessageSend,
+      from: "dev_2",
+      to: "dev_self",
+      payload: { text: "ready?", kind: "ask" },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(onNotifyError).toHaveBeenCalledWith(notificationError, "Device dev_2 asks: ready?", expect.objectContaining({ id: "ask_1" }));
+  });
+
+  it("clears pending state on disconnect and when connecting to a different channel", async () => {
+    const client = new MockClient();
+    const pending = new PendingState();
+    const tool = createRemoteIntercomTool({ client, pending });
+
+    await tool.execute({ action: "connect", channel: "dwkim", pin: "1234" });
+    pending.addAsk({ id: "ask_1", message: "ready?", receivedAt: "2026-01-01T00:00:00.000Z" });
+    pending.addJoinRequest({
+      id: "join_1",
+      joinRequestId: "join_1",
+      deviceId: "dev_2",
+      deviceName: "Laptop",
+      channelId: "ch_1",
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    await tool.execute({ action: "connect", channel: "other", pin: "1234" });
+    expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [] });
+
+    pending.addAsk({ id: "ask_2", message: "still there?", receivedAt: "2026-01-01T00:00:00.000Z" });
+    pending.addJoinRequest({
+      id: "join_2",
+      joinRequestId: "join_2",
+      deviceId: "dev_3",
+      deviceName: "Tablet",
+      channelId: "ch_2",
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    await tool.execute({ action: "disconnect" });
+    expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [] });
   });
 
   it("stores inbound asks and removes them when replied to", async () => {

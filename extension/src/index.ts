@@ -18,6 +18,7 @@ export {
   registerRemoteIntercom,
   type CreateRemoteIntercomToolOptions,
   type NotifyCallback,
+  type NotifyErrorCallback,
   type RemoteIntercomTool,
   type RemoteIntercomToolInput,
   type RemoteIntercomToolResult,
@@ -46,6 +47,7 @@ export function createRemoteIntercomExtension(options: RemoteIntercomExtensionOp
     client,
     pending,
     onNotify: options.onNotify,
+    onNotifyError: options.onNotifyError,
   });
 
   return {
