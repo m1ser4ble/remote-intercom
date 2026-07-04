@@ -314,6 +314,11 @@ func (h *Hub) handleJoinDecision(c *connection, event protocol.Event, approve bo
 			_ = previous.close(websocket.StatusPolicyViolation, "connection superseded")
 		}
 		h.emitPresenceChange(change, pendingConn.deviceID)
+		memberToken, err := h.tokens.IssueMember(c.channelID, join.DeviceID)
+		if err != nil {
+			pendingConn.sendError("internal_error", "could not issue member token", event.ID)
+			return
+		}
 		_ = pendingConn.writeEvent(protocol.Event{
 			Type:      "join.approved",
 			ChannelID: c.channelID,
@@ -323,6 +328,7 @@ func (h *Hub) handleJoinDecision(c *connection, event protocol.Event, approve bo
 			Payload: map[string]any{
 				"joinRequestId": joinRequestID,
 				"deviceId":      join.DeviceID,
+				"token":         memberToken,
 			},
 		})
 		return

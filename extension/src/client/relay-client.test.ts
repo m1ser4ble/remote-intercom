@@ -209,6 +209,27 @@ describe("RelayClient", () => {
     expect(handler).toHaveBeenCalledWith(expect.objectContaining({ id: "evt_in", from: "dev_2" }));
   });
 
+  it("updates pending connection state when join is approved", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload({ status: "pending_approval", token: "pending-token", joinRequestId: "join_1" })), WebSocket: MockWebSocket },
+    );
+
+    await connectAndOpen(client);
+    expect(client.currentStatus).toBe("pending_approval");
+    expect(client.token).toBe("pending-token");
+
+    MockWebSocket.instances[0]?.emitMessage({
+      type: RelayEventType.JoinApproved,
+      channelId: "ch_1",
+      payload: { joinRequestId: "join_1", deviceId: "dev_1", token: "member-token" },
+    });
+
+    expect(client.currentStatus).toBe("connected");
+    expect(client.token).toBe("member-token");
+    expect(client.connectState.joinRequestId).toBeUndefined();
+  });
+
   it("ignores messages from sockets after disconnect", async () => {
     const client = new RelayClient(
       { relayHttpUrl: "http://relay.example", deviceName: "test-device" },

@@ -60,6 +60,9 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	if approved.ReplyTo != "approve-1" {
 		t.Fatalf("replyTo = %q, want approve-1", approved.ReplyTo)
 	}
+	if token, ok := approved.Payload["token"].(string); !ok || token == "" {
+		t.Fatalf("join.approved missing member token payload: %+v", approved.Payload)
+	}
 
 	writeEvent(t, bobWS, protocol.Event{
 		ID:   "send-joined",

@@ -443,11 +443,25 @@ export class RelayClient {
     if (typeof event.type !== "string") {
       return;
     }
+    this.applyStateEvent(event);
     if (event.id !== undefined && event.from !== undefined && event.from !== this.state.deviceId) {
       this.replyTargets.set(event.id, event.from);
     }
     this.emit(event.type, event);
     this.emit("*", event);
+  }
+
+  private applyStateEvent(event: RelayEvent): void {
+    if (event.type !== RelayEventType.JoinApproved) {
+      return;
+    }
+    const payload = event.payload;
+    const token = typeof payload?.token === "string" && payload.token.trim() !== "" ? payload.token : undefined;
+    if (token !== undefined) {
+      this.state.token = token;
+    }
+    this.state.status = "connected";
+    this.state.joinRequestId = undefined;
   }
 
   private emit(eventType: string, event: RelayEvent, reportHandlerErrors = true): void {
