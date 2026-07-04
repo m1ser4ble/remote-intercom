@@ -197,8 +197,24 @@ function installRelayEventHandlers(context: ToolContext): () => void {
     });
     notify(context, `Device ${event.from ?? "unknown"} asks: ${payload.text}`, event);
   };
-  const disposeMessageHandler = context.client.on(RelayEventType.MessageSend, askHandler);
+  const sendHandler = (event: RelayEvent): void => {
+    const payload = event.payload as MessagePayload | undefined;
+    if (payload?.kind === "ask" || typeof payload?.text !== "string") {
+      return;
+    }
+    notify(context, `Device ${event.from ?? "unknown"} says: ${payload.text}`, event);
+  };
+  const replyHandler = (event: RelayEvent): void => {
+    const payload = event.payload as MessagePayload | undefined;
+    if (typeof payload?.text !== "string") {
+      return;
+    }
+    notify(context, `Device ${event.from ?? "unknown"} replied: ${payload.text}`, event);
+  };
+  const disposeMessageAskCompatHandler = context.client.on(RelayEventType.MessageSend, askHandler);
+  const disposeMessageSendHandler = context.client.on(RelayEventType.MessageSend, sendHandler);
   const disposeAskHandler = context.client.on(RelayEventType.MessageAsk, askHandler);
+  const disposeReplyHandler = context.client.on(RelayEventType.MessageReply, replyHandler);
 
   const disposeJoinHandler = context.client.on(RelayEventType.JoinRequest, (event) => {
     const payload = event.payload;
@@ -227,8 +243,10 @@ function installRelayEventHandlers(context: ToolContext): () => void {
   });
 
   return () => {
-    disposeMessageHandler();
+    disposeMessageAskCompatHandler();
+    disposeMessageSendHandler();
     disposeAskHandler();
+    disposeReplyHandler();
     disposeJoinHandler();
   };
 }

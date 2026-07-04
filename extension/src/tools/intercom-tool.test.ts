@@ -283,6 +283,31 @@ describe("remote intercom tool", () => {
     expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [] });
   });
 
+  it("notifies inbound send and reply messages", () => {
+    const client = new MockClient();
+    const onNotify = vi.fn();
+    createRemoteIntercomTool({ client, onNotify });
+
+    client.emit({
+      id: "msg_1",
+      type: RelayEventType.MessageSend,
+      from: "dev_2",
+      to: "dev_self",
+      payload: { text: "hello", kind: "send" },
+    });
+    client.emit({
+      id: "reply_1",
+      type: RelayEventType.MessageReply,
+      from: "dev_2",
+      to: "dev_self",
+      replyTo: "ask_1",
+      payload: { text: "yes", kind: "reply" },
+    });
+
+    expect(onNotify).toHaveBeenCalledWith("Device dev_2 says: hello", expect.objectContaining({ id: "msg_1" }));
+    expect(onNotify).toHaveBeenCalledWith("Device dev_2 replied: yes", expect.objectContaining({ id: "reply_1" }));
+  });
+
   it("stores inbound asks and removes them when replied to", async () => {
     const client = new MockClient();
     const pending = new PendingState();
