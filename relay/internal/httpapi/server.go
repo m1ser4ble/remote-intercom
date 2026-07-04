@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"text/template"
 	"unicode"
@@ -343,7 +342,11 @@ func validatePublicURL(raw string, allowedSchemes ...string) (string, error) {
 }
 
 func renderInstallScript(httpURL, wsURL string) (string, error) {
-	tmpl, err := template.New("install.sh").Option("missingkey=error").Parse(installTemplateContents())
+	templateContents, err := installTemplateContents()
+	if err != nil {
+		return "", err
+	}
+	tmpl, err := template.New("install.sh").Option("missingkey=error").Parse(templateContents)
 	if err != nil {
 		return "", err
 	}
@@ -361,22 +364,15 @@ func renderInstallScript(httpURL, wsURL string) (string, error) {
 	return out.String(), nil
 }
 
-func installTemplateContents() string {
+func installTemplateContents() (string, error) {
 	if configured := strings.TrimSpace(os.Getenv("RELAY_INSTALL_TEMPLATE")); configured != "" {
-		if content, err := os.ReadFile(configured); err == nil {
-			return string(content)
+		content, err := os.ReadFile(configured)
+		if err != nil {
+			return "", err
 		}
+		return string(content), nil
 	}
-	for _, candidate := range []string{
-		filepath.Join("install", "install.sh"),
-		filepath.Join("..", "install", "install.sh"),
-		filepath.Join("..", "..", "..", "install", "install.sh"),
-	} {
-		if content, err := os.ReadFile(candidate); err == nil {
-			return string(content)
-		}
-	}
-	return defaultInstallTemplate
+	return defaultInstallTemplate, nil
 }
 
 func jsonString(value string) string {

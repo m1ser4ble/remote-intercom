@@ -17,13 +17,13 @@ cd relay
 RELAY_TOKEN_SECRET="$(openssl rand -hex 32)" go run ./cmd/relay
 ```
 
-Install local client configuration from the relay:
+Install local client configuration from the relay. The installer writes relay URLs to `${PI_REMOTE_INTERCOM_CONFIG_DIR:-$HOME/.pi/remote-intercom}/config.json` with restrictive file permissions; it does not install a published extension package.
 
 ```bash
 curl -fsSL http://127.0.0.1:8080/install.sh | sh
 ```
 
-Build the extension from this checkout:
+Build the extension from this checkout (MVP/local registration until package publishing is available):
 
 ```bash
 cd extension

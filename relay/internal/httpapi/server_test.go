@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +80,7 @@ func TestConnectSecondDeviceReturnsPendingApproval(t *testing.T) {
 }
 
 func TestInstallScriptUsesForwardedProtoAndHost(t *testing.T) {
+	t.Setenv("RELAY_INSTALL_TEMPLATE", "")
 	handler := newTestServer(t).Routes()
 	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
 	req.Host = "my-relay.example.com"
@@ -107,6 +111,7 @@ func TestInstallScriptUsesForwardedProtoAndHost(t *testing.T) {
 }
 
 func TestInstallScriptUsesConfiguredPublicURLs(t *testing.T) {
+	t.Setenv("RELAY_INSTALL_TEMPLATE", "")
 	server := newTestServer(t)
 	server.PublicHTTPURL = "https://public.example.com/a'b"
 	server.PublicWSURL = "wss://public.example.com/ws"
@@ -144,6 +149,7 @@ func TestInstallScriptRejectsHostileHost(t *testing.T) {
 }
 
 func TestInvalidForwardedProtoFallsBackToHTTP(t *testing.T) {
+	t.Setenv("RELAY_INSTALL_TEMPLATE", "")
 	handler := newTestServer(t).Routes()
 	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
 	req.Host = "my-relay.example.com"
@@ -164,6 +170,139 @@ func TestInvalidForwardedProtoFallsBackToHTTP(t *testing.T) {
 	}
 	if !strings.Contains(body, `RELAY_WS_URL='ws://my-relay.example.com/ws'`) {
 		t.Fatalf("install script missing fallback ws relay url: %s", body)
+	}
+}
+
+func TestInstallScriptUsesExplicitTemplateOverride(t *testing.T) {
+	templatePath := filepath.Join(t.TempDir(), "install.tmpl")
+	if err := os.WriteFile(templatePath, []byte("custom installer {{ .RelayHTTPURLJSON }} {{ .RelayWSURLJSON }}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RELAY_INSTALL_TEMPLATE", templatePath)
+	handler := newTestServer(t).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "relay.example.com"
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %q", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `custom installer "http://relay.example.com" "ws://relay.example.com/ws"`) {
+		t.Fatalf("install script did not use explicit override: %s", body)
+	}
+}
+
+func TestInstallScriptFailsClosedWhenTemplateOverrideUnreadable(t *testing.T) {
+	t.Setenv("RELAY_INSTALL_TEMPLATE", filepath.Join(t.TempDir(), "missing-install.tmpl"))
+	handler := newTestServer(t).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "relay.example.com"
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assertJSONError(t, rec, http.StatusInternalServerError)
+	if strings.Contains(rec.Body.String(), "Remote Intercom relay config") {
+		t.Fatalf("install script fell back after unreadable override: %s", rec.Body.String())
+	}
+}
+
+func TestInstallScriptIgnoresCurrentWorkingDirectoryTemplate(t *testing.T) {
+	t.Setenv("RELAY_INSTALL_TEMPLATE", "")
+	tempDir := t.TempDir()
+	installDir := filepath.Join(tempDir, "install")
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(installDir, "install.sh"), []byte("unexpected cwd template\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldWD); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := newTestServer(t).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "relay.example.com"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %q", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "unexpected cwd template") {
+		t.Fatalf("install script read template from current working directory: %s", body)
+	}
+	if !strings.Contains(body, "Remote Intercom relay config written") {
+		t.Fatalf("install script did not use compiled default template: %s", body)
+	}
+}
+
+func TestRenderedInstallScriptWritesConfigWithRestrictivePermissions(t *testing.T) {
+	t.Setenv("RELAY_INSTALL_TEMPLATE", "")
+	handler := newTestServer(t).Routes()
+	req := httptest.NewRequest(http.MethodGet, "/install.sh", nil)
+	req.Host = "relay.example.com:8443"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body = %q", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	tempDir := t.TempDir()
+	configDir := filepath.Join(tempDir, "config")
+	scriptPath := filepath.Join(tempDir, "install.sh")
+	if err := os.WriteFile(scriptPath, rec.Body.Bytes(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", scriptPath)
+	cmd.Env = append(os.Environ(),
+		"HOME="+filepath.Join(tempDir, "home"),
+		"PI_REMOTE_INTERCOM_CONFIG_DIR="+configDir,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rendered install script failed: %v\n%s", err, output)
+	}
+
+	configPath := filepath.Join(configDir, "config.json")
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		RelayHTTPURL string `json:"relayHttpUrl"`
+		RelayWSURL   string `json:"relayWsUrl"`
+	}
+	if err := json.Unmarshal(configBytes, &config); err != nil {
+		t.Fatalf("config.json is not valid JSON: %v\n%s", err, configBytes)
+	}
+	if config.RelayHTTPURL != "https://relay.example.com:8443" {
+		t.Fatalf("relayHttpUrl = %q, want https://relay.example.com:8443", config.RelayHTTPURL)
+	}
+	if config.RelayWSURL != "wss://relay.example.com:8443/ws" {
+		t.Fatalf("relayWsUrl = %q, want wss://relay.example.com:8443/ws", config.RelayWSURL)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got&0o077 != 0 {
+		t.Fatalf("config file permissions = %v, want no group/world permissions", got)
 	}
 }
 
