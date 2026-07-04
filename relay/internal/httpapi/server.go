@@ -15,6 +15,7 @@ import (
 	"github.com/remote-intercom/remote-intercom/relay/internal/auth"
 	"github.com/remote-intercom/remote-intercom/relay/internal/channel"
 	"github.com/remote-intercom/remote-intercom/relay/internal/protocol"
+	wshub "github.com/remote-intercom/remote-intercom/relay/internal/ws"
 )
 
 const (
@@ -26,6 +27,7 @@ const (
 type Server struct {
 	Registry      *channel.Registry
 	TokenManager  *auth.TokenManager
+	Hub           *wshub.Hub
 	Version       string
 	PublicHTTPURL string
 	PublicWSURL   string
@@ -35,7 +37,7 @@ func NewServer(registry *channel.Registry, tokenManager *auth.TokenManager, vers
 	if version == "" {
 		version = defaultVersion
 	}
-	return &Server{Registry: registry, TokenManager: tokenManager, Version: version}
+	return &Server{Registry: registry, TokenManager: tokenManager, Hub: wshub.NewHub(registry, tokenManager), Version: version}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -44,6 +46,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.HandleFunc("GET /install.sh", s.handleInstall)
 	mux.HandleFunc("POST /channels/connect", s.handleConnect)
+	if s.Hub != nil {
+		mux.Handle("GET /ws", s.Hub)
+	}
 	return mux
 }
 
