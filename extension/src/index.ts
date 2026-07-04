@@ -1,6 +1,3 @@
-import { Type } from "@earendil-works/pi-ai";
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
 import { RelayClient, type RelayClientDependencies } from "./client/relay-client.js";
 import { type RelayClientConfig } from "./state/config.js";
 import { PendingState } from "./state/pending.js";
@@ -28,6 +25,11 @@ export {
   type RemoteIntercomToolResult,
   type ToolContext,
 } from "./tools/intercom-tool.js";
+
+export interface ExtensionAPI {
+  registerTool(tool: unknown): unknown;
+  sendMessage?: (message: unknown, options?: unknown) => unknown;
+}
 
 export interface RemoteIntercomExtensionOptions extends Omit<CreateRemoteIntercomToolOptions, "client" | "pending"> {
   config?: RelayClientConfig;
@@ -88,7 +90,7 @@ export default function remoteIntercomExtension(input: ExtensionAPI | RemoteInte
 }
 
 export function toPiTool(tool: RemoteIntercomTool) {
-  return defineTool({
+  return {
     name: tool.name,
     label: "Remote Intercom",
     description: tool.description,
@@ -97,27 +99,32 @@ export function toPiTool(tool: RemoteIntercomTool) {
       "Use remote_intercom when the user asks to connect pi sessions through the remote intercom relay.",
       "Use remote_intercom approve_join or deny_join when a remote join request notification includes a joinRequestId.",
     ],
-    parameters: Type.Object({
-      action: Type.String({ description: "Action: connect, list, send, ask, reply, pending, status, disconnect, approve_join, or deny_join" }),
-      channel: Type.Optional(Type.String()),
-      channelName: Type.Optional(Type.String()),
-      pin: Type.Optional(Type.String()),
-      deviceName: Type.Optional(Type.String()),
-      deviceId: Type.Optional(Type.String()),
-      clientVersion: Type.Optional(Type.String()),
-      to: Type.Optional(Type.String()),
-      message: Type.Optional(Type.String()),
-      id: Type.Optional(Type.String()),
-      replyTo: Type.Optional(Type.String()),
-      joinRequestId: Type.Optional(Type.String()),
-      code: Type.Optional(Type.Number()),
-      reason: Type.Optional(Type.String()),
-    }),
-    async execute(_toolCallId, params) {
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", description: "Action: connect, list, send, ask, reply, pending, status, disconnect, approve_join, or deny_join" },
+        channel: { type: "string" },
+        channelName: { type: "string" },
+        pin: { type: "string" },
+        deviceName: { type: "string" },
+        deviceId: { type: "string" },
+        clientVersion: { type: "string" },
+        to: { type: "string" },
+        message: { type: "string" },
+        id: { type: "string" },
+        replyTo: { type: "string" },
+        joinRequestId: { type: "string" },
+        code: { type: "number" },
+        reason: { type: "string" },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId: string, params: unknown) {
       const result = await tool.execute(params);
       return formatToolResult(result);
     },
-  });
+  };
 }
 
 function registerWithUnknownApi(api: unknown, tool: RemoteIntercomTool): void {
