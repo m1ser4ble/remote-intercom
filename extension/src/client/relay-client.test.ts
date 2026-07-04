@@ -1,15 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RelayClient, type FetchLike, type WebSocketLike } from "./relay-client.js";
 import { RelayEventType, type ConnectResponse, type RelayEvent } from "./protocol.js";
+
+type MockWebSocketEvent = "open" | "message" | "close" | "error";
 
 class MockWebSocket implements WebSocketLike {
   static instances: MockWebSocket[] = [];
 
   readonly url: string;
-  readyState = 1;
+  readyState = 0;
   sent: string[] = [];
-  private handlers = new Map<string, Set<(...args: unknown[]) => void>>();
+  private handlers = new Map<MockWebSocketEvent, Set<(...args: unknown[]) => void>>();
 
   constructor(url: string) {
     this.url = url;
@@ -25,18 +27,35 @@ class MockWebSocket implements WebSocketLike {
     this.emit("close");
   }
 
-  on(event: "message" | "close" | "error", handler: (...args: unknown[]) => void): void {
+  on(event: MockWebSocketEvent, handler: (...args: unknown[]) => void): void {
     const handlers = this.handlers.get(event) ?? new Set<(...args: unknown[]) => void>();
     handlers.add(handler);
     this.handlers.set(event, handlers);
+  }
+
+  off(event: MockWebSocketEvent, handler: (...args: unknown[]) => void): void {
+    this.handlers.get(event)?.delete(handler);
+  }
+
+  removeListener(event: MockWebSocketEvent, handler: (...args: unknown[]) => void): void {
+    this.off(event, handler);
+  }
+
+  emitOpen(): void {
+    this.readyState = 1;
+    this.emit("open");
+  }
+
+  emitError(error: unknown): void {
+    this.emit("error", error);
   }
 
   emitMessage(event: RelayEvent): void {
     this.emit("message", JSON.stringify(event));
   }
 
-  private emit(event: string, ...args: unknown[]): void {
-    for (const handler of this.handlers.get(event) ?? []) {
+  private emit(event: MockWebSocketEvent, ...args: unknown[]): void {
+    for (const handler of [...(this.handlers.get(event) ?? [])]) {
       handler(...args);
     }
   }
@@ -44,6 +63,21 @@ class MockWebSocket implements WebSocketLike {
 
 function resetSockets(): void {
   MockWebSocket.instances = [];
+}
+
+async function flushPromises(): Promise<void> {
+  for (let index = 0; index < 5; index += 1) {
+    await Promise.resolve();
+  }
+}
+
+async function connectAndOpen(client: RelayClient, channel = "dwkim", pin = "1234"): Promise<ConnectResponse> {
+  const connectPromise = client.connect(channel, pin);
+  await flushPromises();
+  const socket = MockWebSocket.instances.at(-1);
+  expect(socket).toBeDefined();
+  socket?.emitOpen();
+  return connectPromise;
 }
 
 function connectPayload(overrides: Partial<ConnectResponse> = {}): ConnectResponse {
@@ -67,8 +101,11 @@ function mockFetch(payload: unknown, init: { ok?: boolean; status?: number; stat
 }
 
 describe("RelayClient", () => {
-  it("posts connect body and opens WebSocket with token query", async () => {
+  beforeEach(() => {
     resetSockets();
+  });
+
+  it("posts connect body and opens WebSocket with token query after the socket opens", async () => {
     const fetchImpl = mockFetch(connectPayload());
     const client = new RelayClient(
       {
@@ -80,9 +117,21 @@ describe("RelayClient", () => {
       { fetch: fetchImpl, WebSocket: MockWebSocket },
     );
 
-    const response = await client.connect("dwkim", "1234");
+    const connectPromise = client.connect("dwkim", "1234");
+    const resolved = vi.fn();
+    connectPromise.then(resolved);
+    await flushPromises();
+
+    expect(resolved).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+    expect(MockWebSocket.instances[0]?.readyState).toBe(0);
+    expect(MockWebSocket.instances[0]?.url).toBe("ws://relay.example/ws?token=token+with+spaces");
+
+    MockWebSocket.instances[0]?.emitOpen();
+    const response = await connectPromise;
 
     expect(response.token).toBe("token with spaces");
+    expect(resolved).toHaveBeenCalledTimes(1);
     expect(client.token).toBe("token with spaces");
     expect(client.channelId).toBe("ch_1");
     expect(fetchImpl).toHaveBeenCalledWith("http://relay.example/channels/connect", {
@@ -100,12 +149,46 @@ describe("RelayClient", () => {
       }),
       signal: undefined,
     });
-    expect(MockWebSocket.instances).toHaveLength(1);
-    expect(MockWebSocket.instances[0]?.url).toBe("ws://relay.example/ws?token=token+with+spaces");
+  });
+
+  it("rejects connect when the WebSocket errors before opening", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket },
+    );
+
+    const connectPromise = client.connect("dwkim", "1234");
+    const rejection = expect(connectPromise).rejects.toMatchObject({
+      message: "relay WebSocket error before opening: boom",
+      details: new Error("boom"),
+    });
+    await flushPromises();
+    MockWebSocket.instances[0]?.emitError(new Error("boom"));
+
+    await rejection;
+    expect(client.webSocket).toBeUndefined();
+  });
+
+  it("emits error events when the WebSocket errors after opening", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket },
+    );
+    const errorHandler = vi.fn();
+    client.on(RelayEventType.Error, errorHandler);
+
+    await connectAndOpen(client);
+    MockWebSocket.instances[0]?.emitError(new Error("late boom"));
+
+    expect(errorHandler).toHaveBeenCalledTimes(1);
+    expect(errorHandler).toHaveBeenCalledWith(expect.objectContaining({
+      type: RelayEventType.Error,
+      channelId: "ch_1",
+      payload: expect.objectContaining({ code: "websocket_error", message: "late boom" }),
+    }));
   });
 
   it("invokes registered handlers for incoming WebSocket messages", async () => {
-    resetSockets();
     const client = new RelayClient(
       { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
       { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket },
@@ -113,7 +196,7 @@ describe("RelayClient", () => {
     const handler = vi.fn();
     client.on(RelayEventType.MessageSend, handler);
 
-    await client.connect("dwkim", "1234");
+    await connectAndOpen(client);
     MockWebSocket.instances[0]?.emitMessage({
       id: "evt_in",
       type: RelayEventType.MessageSend,
@@ -126,8 +209,107 @@ describe("RelayClient", () => {
     expect(handler).toHaveBeenCalledWith(expect.objectContaining({ id: "evt_in", from: "dev_2" }));
   });
 
+  it("ignores messages from sockets after disconnect", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket },
+    );
+    const handler = vi.fn();
+    client.on(RelayEventType.MessageSend, handler);
+
+    await connectAndOpen(client);
+    const oldSocket = MockWebSocket.instances[0];
+    client.disconnect();
+    oldSocket?.emitMessage({
+      id: "stale",
+      type: RelayEventType.MessageSend,
+      from: "dev_2",
+      to: "dev_1",
+      payload: { text: "stale" },
+    });
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("ignores messages from sockets after reconnect", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket },
+    );
+    const handler = vi.fn();
+    client.on(RelayEventType.MessageSend, handler);
+
+    await connectAndOpen(client);
+    const oldSocket = MockWebSocket.instances[0];
+    const reconnectPromise = client.connect("dwkim", "1234");
+    await flushPromises();
+    const newSocket = MockWebSocket.instances[1];
+    expect(newSocket).toBeDefined();
+
+    oldSocket?.emitMessage({
+      id: "old_before_open",
+      type: RelayEventType.MessageSend,
+      from: "dev_2",
+      to: "dev_1",
+      payload: { text: "old before open" },
+    });
+    newSocket?.emitOpen();
+    await reconnectPromise;
+    oldSocket?.emitMessage({
+      id: "old_after_open",
+      type: RelayEventType.MessageSend,
+      from: "dev_2",
+      to: "dev_1",
+      payload: { text: "old after open" },
+    });
+    newSocket?.emitMessage({
+      id: "new_after_open",
+      type: RelayEventType.MessageSend,
+      from: "dev_2",
+      to: "dev_1",
+      payload: { text: "new after open" },
+    });
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ id: "new_after_open" }));
+  });
+
+  it("continues dispatching later handlers when an earlier handler throws", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket },
+    );
+    const thrown = new Error("handler failed");
+    const secondHandler = vi.fn();
+    const errorHandler = vi.fn();
+    client.on(RelayEventType.MessageSend, () => {
+      throw thrown;
+    });
+    client.on(RelayEventType.MessageSend, secondHandler);
+    client.on(RelayEventType.Error, errorHandler);
+
+    await connectAndOpen(client);
+    MockWebSocket.instances[0]?.emitMessage({
+      id: "evt_in",
+      type: RelayEventType.MessageSend,
+      from: "dev_2",
+      to: "dev_1",
+      payload: { text: "hello" },
+    });
+
+    expect(secondHandler).toHaveBeenCalledTimes(1);
+    expect(errorHandler).toHaveBeenCalledTimes(1);
+    expect(errorHandler).toHaveBeenCalledWith(expect.objectContaining({
+      type: RelayEventType.Error,
+      payload: expect.objectContaining({
+        code: "handler_error",
+        message: "handler failed",
+        handlerEventType: RelayEventType.MessageSend,
+      }),
+    }));
+  });
+
   it("serializes send, ask, reply, join decisions, list, and status events", async () => {
-    resetSockets();
     let counter = 0;
     const client = new RelayClient(
       { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
@@ -137,7 +319,7 @@ describe("RelayClient", () => {
         idGenerator: () => `evt_${++counter}`,
       },
     );
-    await client.connect("dwkim", "1234");
+    await connectAndOpen(client);
     const socket = MockWebSocket.instances[0];
     expect(socket).toBeDefined();
 
@@ -162,8 +344,30 @@ describe("RelayClient", () => {
     ]);
   });
 
+  it("serializes approveJoin and denyJoin aliases", async () => {
+    let counter = 0;
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      {
+        fetch: mockFetch(connectPayload()),
+        WebSocket: MockWebSocket,
+        idGenerator: () => `evt_${++counter}`,
+      },
+    );
+    await connectAndOpen(client);
+    const socket = MockWebSocket.instances[0];
+
+    client.approveJoin("join_alias_1");
+    client.denyJoin("join_alias_2");
+
+    const events = socket?.sent.map((raw) => JSON.parse(raw) as RelayEvent) ?? [];
+    expect(events).toEqual([
+      expect.objectContaining({ id: "evt_1", type: RelayEventType.JoinApprove, channelId: "ch_1", payload: { joinRequestId: "join_alias_1" } }),
+      expect.objectContaining({ id: "evt_2", type: RelayEventType.JoinDeny, channelId: "ch_1", payload: { joinRequestId: "join_alias_2" } }),
+    ]);
+  });
+
   it("throws useful errors for non-2xx JSON responses", async () => {
-    resetSockets();
     const client = new RelayClient(
       { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
       { fetch: mockFetch({ error: "bad pin" }, { ok: false, status: 403 }), WebSocket: MockWebSocket },

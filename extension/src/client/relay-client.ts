@@ -12,6 +12,9 @@ import { type RelayClientConfig, normalizeConfig } from "../state/config.js";
 
 const WEBSOCKET_OPEN = 1;
 
+type WebSocketEventType = "open" | "message" | "close" | "error";
+type WebSocketEventHandler = (...args: unknown[]) => void;
+
 type FetchInit = {
   method?: string;
   headers?: Record<string, string>;
@@ -33,11 +36,11 @@ export interface WebSocketLike {
   readyState: number;
   send(data: string): void;
   close?(code?: number, reason?: string): void;
-  addEventListener?(event: "message" | "close" | "error", handler: (event: unknown) => void): void;
-  removeEventListener?(event: "message" | "close" | "error", handler: (event: unknown) => void): void;
-  on?(event: "message" | "close" | "error", handler: (...args: unknown[]) => void): void;
-  off?(event: "message" | "close" | "error", handler: (...args: unknown[]) => void): void;
-  removeListener?(event: "message" | "close" | "error", handler: (...args: unknown[]) => void): void;
+  addEventListener?(event: WebSocketEventType, handler: (event: unknown) => void): void;
+  removeEventListener?(event: WebSocketEventType, handler: (event: unknown) => void): void;
+  on?(event: WebSocketEventType, handler: WebSocketEventHandler): void;
+  off?(event: WebSocketEventType, handler: WebSocketEventHandler): void;
+  removeListener?(event: WebSocketEventType, handler: WebSocketEventHandler): void;
 }
 
 export type WebSocketConstructorLike = new (url: string) => WebSocketLike;
@@ -86,6 +89,8 @@ export class RelayClient {
   private readonly handlers = new Map<string, Set<RelayEventHandler>>();
   private readonly replyTargets = new Map<string, string>();
   private socket?: WebSocketLike;
+  private socketCleanup?: () => void;
+  private pendingOpenReject?: (error: RelayClientError) => void;
   private state: RelayClientState = {};
 
   constructor(config: RelayClientConfig = {}, dependencies: RelayClientDependencies = {}) {
@@ -159,7 +164,7 @@ export class RelayClient {
       wsUrl: connectResponse.wsUrl,
     };
 
-    this.openSocket(connectResponse.wsUrl || this.config.relayWsUrl, connectResponse.token);
+    await this.openSocket(connectResponse.wsUrl || this.config.relayWsUrl, connectResponse.token);
     return connectResponse;
   }
 
@@ -257,32 +262,104 @@ export class RelayClient {
 
   disconnect(code?: number, reason?: string): void {
     const socket = this.socket;
-    this.socket = undefined;
+    const rejectPendingOpen = this.pendingOpenReject;
+    if (rejectPendingOpen !== undefined) {
+      rejectPendingOpen(new RelayClientError("relay WebSocket connection was cancelled"));
+    } else {
+      const cleanup = this.socketCleanup;
+      this.socket = undefined;
+      this.socketCleanup = undefined;
+      cleanup?.();
+    }
     socket?.close?.(code, reason);
   }
 
-  private openSocket(wsUrl: string, token: string): void {
+  private openSocket(wsUrl: string, token: string): Promise<void> {
     this.disconnect();
     const socket = new this.WebSocketImpl(socketURLWithToken(wsUrl, token));
     this.socket = socket;
 
-    const messageHandler = (first: unknown): void => {
-      const data = messageData(first);
-      this.handleSocketMessage(data);
-    };
-    const closeHandler = (): void => {
-      if (this.socket === socket) {
-        this.socket = undefined;
-      }
-    };
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let removeListeners = (): void => undefined;
 
-    if (socket.addEventListener !== undefined) {
-      socket.addEventListener("message", messageHandler);
-      socket.addEventListener("close", closeHandler);
-    } else if (socket.on !== undefined) {
-      socket.on("message", messageHandler);
-      socket.on("close", closeHandler);
-    }
+      let rejectBeforeOpen: (error: RelayClientError) => void;
+      const cleanup = (): void => {
+        removeListeners();
+        if (this.socketCleanup === cleanup) {
+          this.socketCleanup = undefined;
+        }
+        if (this.pendingOpenReject === rejectBeforeOpen) {
+          this.pendingOpenReject = undefined;
+        }
+      };
+      const isCurrentSocket = (): boolean => this.socket === socket;
+      rejectBeforeOpen = (error: RelayClientError): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (isCurrentSocket()) {
+          this.socket = undefined;
+        }
+        cleanup();
+        reject(error);
+      };
+
+      this.socketCleanup = cleanup;
+      this.pendingOpenReject = rejectBeforeOpen;
+
+      const openHandler = (): void => {
+        if (!isCurrentSocket() || settled) {
+          return;
+        }
+        settled = true;
+        if (this.pendingOpenReject === rejectBeforeOpen) {
+          this.pendingOpenReject = undefined;
+        }
+        resolve();
+      };
+      const messageHandler = (first: unknown): void => {
+        if (!isCurrentSocket()) {
+          return;
+        }
+        const data = messageData(first);
+        this.handleSocketMessage(data);
+      };
+      const closeHandler = (): void => {
+        if (!isCurrentSocket()) {
+          return;
+        }
+        if (!settled) {
+          rejectBeforeOpen(new RelayClientError("relay WebSocket closed before opening"));
+          return;
+        }
+        this.socket = undefined;
+        cleanup();
+      };
+      const errorHandler = (first: unknown): void => {
+        if (!isCurrentSocket()) {
+          return;
+        }
+        if (!settled) {
+          rejectBeforeOpen(socketErrorToRelayClientError(first));
+          socket.close?.();
+          return;
+        }
+        this.emitError("websocket_error", first);
+      };
+
+      removeListeners = combineCleanups(
+        addSocketListener(socket, "open", openHandler),
+        addSocketListener(socket, "message", messageHandler),
+        addSocketListener(socket, "close", closeHandler),
+        addSocketListener(socket, "error", errorHandler),
+      );
+
+      if (socket.readyState === WEBSOCKET_OPEN) {
+        openHandler();
+      }
+    });
   }
 
   private handleSocketMessage(rawData: unknown): void {
@@ -308,14 +385,32 @@ export class RelayClient {
     this.emit("*", event);
   }
 
-  private emit(eventType: string, event: RelayEvent): void {
+  private emit(eventType: string, event: RelayEvent, reportHandlerErrors = true): void {
     const handlers = this.handlers.get(eventType);
     if (handlers === undefined) {
       return;
     }
     for (const handler of [...handlers]) {
-      handler(event);
+      try {
+        handler(event);
+      } catch (error) {
+        if (reportHandlerErrors && eventType !== RelayEventType.Error) {
+          this.emitError("handler_error", error, { handlerEventType: eventType });
+        }
+      }
     }
+  }
+
+  private emitError(code: string, error: unknown, details: Record<string, unknown> = {}): void {
+    this.emit(RelayEventType.Error, {
+      type: RelayEventType.Error,
+      channelId: this.state.channelId,
+      payload: {
+        code,
+        message: errorMessage(error),
+        ...details,
+      },
+    }, false);
   }
 }
 
@@ -382,6 +477,65 @@ function socketURLWithToken(wsUrl: string, token: string): string {
   const url = new URL(wsUrl);
   url.searchParams.set("token", token);
   return url.toString();
+}
+
+function addSocketListener(socket: WebSocketLike, event: WebSocketEventType, handler: WebSocketEventHandler): () => void {
+  if (socket.addEventListener !== undefined) {
+    const eventHandler = handler as (event: unknown) => void;
+    socket.addEventListener(event, eventHandler);
+    return () => socket.removeEventListener?.(event, eventHandler);
+  }
+  if (socket.on !== undefined) {
+    socket.on(event, handler);
+    return () => {
+      if (socket.off !== undefined) {
+        socket.off(event, handler);
+      } else {
+        socket.removeListener?.(event, handler);
+      }
+    };
+  }
+  return () => undefined;
+}
+
+function combineCleanups(...cleanups: Array<() => void>): () => void {
+  let called = false;
+  return () => {
+    if (called) {
+      return;
+    }
+    called = true;
+    for (const cleanup of cleanups) {
+      cleanup();
+    }
+  };
+}
+
+function socketErrorToRelayClientError(error: unknown): RelayClientError {
+  return new RelayClientError(`relay WebSocket error before opening: ${errorMessage(error)}`, undefined, error);
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim() !== "") {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim() !== "") {
+    return error;
+  }
+  if (isRecord(error)) {
+    const message = error.message;
+    if (typeof message === "string" && message.trim() !== "") {
+      return message;
+    }
+    const nestedError = error.error;
+    if (nestedError instanceof Error && nestedError.message.trim() !== "") {
+      return nestedError.message;
+    }
+    if (typeof nestedError === "string" && nestedError.trim() !== "") {
+      return nestedError;
+    }
+  }
+  return "unknown error";
 }
 
 function messageData(messageEventOrData: unknown): unknown {
