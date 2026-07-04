@@ -22,13 +22,25 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
+func (c Claims) Validate() error {
+	return validateClaims(&c)
+}
+
 type TokenManager struct {
 	secret []byte
 	ttl    time.Duration
 }
 
-func NewTokenManager(secret []byte, ttl time.Duration) *TokenManager {
-	return &TokenManager{secret: secret, ttl: ttl}
+func NewTokenManager(secret []byte, ttl time.Duration) (*TokenManager, error) {
+	if len(secret) < 32 {
+		return nil, errors.New("token secret must be at least 32 bytes")
+	}
+	if ttl <= 0 {
+		return nil, errors.New("token ttl must be positive")
+	}
+	secretCopy := make([]byte, len(secret))
+	copy(secretCopy, secret)
+	return &TokenManager{secret: secretCopy, ttl: ttl}, nil
 }
 
 func (m *TokenManager) IssueMember(channelID, deviceID string) (string, error) {
@@ -46,18 +58,41 @@ func (m *TokenManager) issue(claims Claims) (string, error) {
 }
 
 func (m *TokenManager) Verify(raw string) (*Claims, error) {
-	token, err := jwt.ParseWithClaims(raw, &Claims{}, func(token *jwt.Token) (any, error) {
-		if token.Method != jwt.SigningMethodHS256 {
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(raw, claims, func(token *jwt.Token) (any, error) {
+		if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
 			return nil, errors.New("unexpected signing method")
 		}
 		return m.secret, nil
-	})
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
 	if err != nil {
 		return nil, err
 	}
-	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
+	if !token.Valid {
 		return nil, errors.New("invalid token")
 	}
+	if err := validateClaims(claims); err != nil {
+		return nil, err
+	}
 	return claims, nil
+}
+
+func validateClaims(claims *Claims) error {
+	if claims.ChannelID == "" {
+		return errors.New("missing channel id")
+	}
+	if claims.DeviceID == "" {
+		return errors.New("missing device id")
+	}
+	switch claims.Role {
+	case RoleMember:
+		return nil
+	case RolePending:
+		if claims.JoinRequestID == "" {
+			return errors.New("missing join request id")
+		}
+		return nil
+	default:
+		return errors.New("invalid role")
+	}
 }
