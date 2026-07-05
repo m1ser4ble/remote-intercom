@@ -220,7 +220,7 @@ func (h *Hub) handleMessageSend(c *connection, event protocol.Event) {
 		return
 	}
 
-	target := h.memberConnection(c.channelID, event.To)
+	target := h.memberConnectionByTarget(c.channelID, event.To)
 	if target == nil || !target.isMember() {
 		c.sendError("unknown_target", "target is not online", event.ID)
 		return
@@ -228,6 +228,7 @@ func (h *Hub) handleMessageSend(c *connection, event protocol.Event) {
 
 	event.ChannelID = c.channelID
 	event.From = c.deviceID
+	event.To = target.deviceID
 	if event.Payload == nil {
 		event.Payload = map[string]any{}
 	}
@@ -711,6 +712,29 @@ func (h *Hub) memberConnection(channelID, deviceID string) *connection {
 		return nil
 	}
 	return h.members[channelID][deviceID]
+}
+
+func (h *Hub) memberConnectionByTarget(channelID, target string) *connection {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	if conn := h.memberConnection(channelID, target); conn != nil {
+		return conn
+	}
+	ch := h.registry.Channel(channelID)
+	if ch == nil {
+		return nil
+	}
+	for _, member := range ch.Members {
+		if !member.Online || member.DeviceName != target {
+			continue
+		}
+		if conn := h.memberConnection(channelID, member.DeviceID); conn != nil {
+			return conn
+		}
+	}
+	return nil
 }
 
 func (h *Hub) memberConnections(channelID string) []*connection {

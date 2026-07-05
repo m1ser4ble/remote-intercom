@@ -4,9 +4,11 @@ import {
   type ConnectRequest,
   type ConnectResponse,
   type JoinDecisionPayload,
+  type ListResponsePayload,
   type MessagePayload,
   type RelayEvent,
   RelayEventType,
+  type StatusResponsePayload,
 } from "./protocol.js";
 import { type RelayClientConfig, normalizeConfig } from "../state/config.js";
 
@@ -46,6 +48,12 @@ export interface WebSocketLike {
 export type WebSocketConstructorLike = new (url: string) => WebSocketLike;
 export type RelayEventHandler = (event: RelayEvent) => void;
 export type IdGenerator = () => string;
+
+export interface RelayRequestResponse<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+  requestEvent: RelayEvent;
+  responseEvent: RelayEvent<TPayload>;
+  payload: TPayload;
+}
 
 export interface RelayClientDependencies {
   fetch?: FetchLike;
@@ -89,6 +97,7 @@ export class RelayClient {
   private readonly idGenerator: IdGenerator;
   private readonly reconnectDelayMs: number;
   private readonly handlers = new Map<string, Set<RelayEventHandler>>();
+  private readonly responseWaiters = new Map<string, { responseType: string; resolve: (event: RelayEvent) => void; reject: (error: RelayClientError) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly replyTargets = new Map<string, string>();
   private readonly suppressReconnectForSocket = new WeakSet<WebSocketLike>();
   private socket?: WebSocketLike;
@@ -267,12 +276,40 @@ export class RelayClient {
     return this.deny(joinRequestId);
   }
 
-  list(): RelayEvent {
-    return this.sendEvent({ type: RelayEventType.ListRequest });
+  async list(timeoutMs = 5_000): Promise<RelayRequestResponse<ListResponsePayload>> {
+    return this.requestResponse<ListResponsePayload>({ type: RelayEventType.ListRequest }, RelayEventType.ListResponse, timeoutMs);
   }
 
-  status(): RelayEvent {
-    return this.sendEvent({ type: RelayEventType.StatusRequest });
+  async status(timeoutMs = 5_000): Promise<RelayRequestResponse<StatusResponsePayload>> {
+    return this.requestResponse<StatusResponsePayload>({ type: RelayEventType.StatusRequest }, RelayEventType.StatusResponse, timeoutMs);
+  }
+
+  requestResponse<TPayload extends Record<string, unknown>>(event: RelayEvent, responseType: string, timeoutMs = 5_000): Promise<RelayRequestResponse<TPayload>> {
+    const requestEvent = this.sendEvent(event);
+    const requestId = requestEvent.id;
+    if (requestId === undefined) {
+      throw new RelayClientError("request event was missing id");
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.responseWaiters.delete(requestId);
+        reject(new RelayClientError(`timed out waiting for ${responseType}`));
+      }, timeoutMs);
+      this.responseWaiters.set(requestId, {
+        responseType,
+        resolve: (responseEvent) => {
+          const payload = responseEvent.payload;
+          if (!isRecord(payload)) {
+            reject(new RelayClientError(`${responseType} response was missing payload`, undefined, responseEvent));
+            return;
+          }
+          resolve({ requestEvent, responseEvent: responseEvent as RelayEvent<TPayload>, payload: payload as TPayload });
+        },
+        reject,
+        timer,
+      });
+    });
   }
 
   disconnect(code?: number, reason?: string): void {
@@ -386,6 +423,11 @@ export class RelayClient {
       this.socketCleanup = undefined;
       cleanup?.();
     }
+    for (const [id, waiter] of this.responseWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new RelayClientError("relay WebSocket connection was closed before response"));
+      this.responseWaiters.delete(id);
+    }
     socket?.close?.(code, reason);
   }
 
@@ -444,11 +486,26 @@ export class RelayClient {
       return;
     }
     this.applyStateEvent(event);
+    this.resolveResponseWaiter(event);
     if (event.id !== undefined && event.from !== undefined && event.from !== this.state.deviceId) {
       this.replyTargets.set(event.id, event.from);
     }
     this.emit(event.type, event);
     this.emit("*", event);
+  }
+
+  private resolveResponseWaiter(event: RelayEvent): void {
+    const replyTo = event.replyTo;
+    if (replyTo === undefined) {
+      return;
+    }
+    const waiter = this.responseWaiters.get(replyTo);
+    if (waiter === undefined || waiter.responseType !== event.type) {
+      return;
+    }
+    this.responseWaiters.delete(replyTo);
+    clearTimeout(waiter.timer);
+    waiter.resolve(event);
   }
 
   private applyStateEvent(event: RelayEvent): void {

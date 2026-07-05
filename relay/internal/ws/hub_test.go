@@ -102,6 +102,26 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	}
 
 	writeEvent(t, aliceWS, protocol.Event{
+		ID:   "send-by-name",
+		Type: "message.send",
+		To:   "bob-laptop",
+		Payload: map[string]any{
+			"text": "hello by name",
+		},
+	})
+
+	byName := readEvent(t, bobWS)
+	if byName.Type != "message.send" {
+		t.Fatalf("event type = %q, want message.send", byName.Type)
+	}
+	if byName.From != "dev_alice" || byName.To != "dev_bob" {
+		t.Fatalf("name route = %s -> %s, want dev_alice -> dev_bob", byName.From, byName.To)
+	}
+	if got := stringPayload(t, byName.Payload, "text"); got != "hello by name" {
+		t.Fatalf("payload text = %q, want hello by name", got)
+	}
+
+	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "ask-1",
 		Type: "message.ask",
 		To:   "dev_bob",

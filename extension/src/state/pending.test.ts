@@ -23,13 +23,23 @@ describe("PendingState", () => {
 
     expect(pending.getAsk("ask_1")?.message).toBe("question?");
     expect(pending.getJoinRequest("join_1")?.deviceName).toBe("Laptop");
+    pending.addInbox({
+      id: "msg_1",
+      type: "message.send",
+      from: "dev_2",
+      message: "hello",
+      receivedAt: "2026-07-04T00:00:02.000Z",
+    });
+
     expect(pending.snapshot()).toEqual({
       asks: [expect.objectContaining({ id: "ask_1" })],
       joinRequests: [expect.objectContaining({ id: "join_1" })],
+      inbox: [expect.objectContaining({ id: "msg_1", type: "message.send" })],
     });
 
     expect(pending.deleteAsk("ask_1")).toBe(true);
     expect(pending.deleteJoinRequest("join_1")).toBe(true);
-    expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [] });
+    expect(pending.deleteInbox("msg_1")).toBe(true);
+    expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [], inbox: [] });
   });
 });

@@ -209,6 +209,54 @@ describe("RelayClient", () => {
     expect(handler).toHaveBeenCalledWith(expect.objectContaining({ id: "evt_in", from: "dev_2" }));
   });
 
+  it("waits for list and status responses that match the request id", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => "req_1" },
+    );
+
+    await connectAndOpen(client);
+    const listPromise = client.list();
+    expect(JSON.parse(MockWebSocket.instances[0]?.sent.at(-1) ?? "{}")).toEqual(expect.objectContaining({
+      id: "req_1",
+      type: RelayEventType.ListRequest,
+    }));
+
+    MockWebSocket.instances[0]?.emitMessage({
+      id: "list_resp_1",
+      type: RelayEventType.ListResponse,
+      channelId: "ch_1",
+      replyTo: "req_1",
+      payload: {
+        ownerId: "dev_1",
+        members: [
+          { deviceId: "dev_1", deviceName: "Alice", online: true, owner: true },
+          { deviceId: "dev_2", deviceName: "Bob", online: true, owner: false },
+        ],
+      },
+    });
+
+    await expect(listPromise).resolves.toEqual(expect.objectContaining({
+      requestEvent: expect.objectContaining({ id: "req_1", type: RelayEventType.ListRequest }),
+      responseEvent: expect.objectContaining({ type: RelayEventType.ListResponse, replyTo: "req_1" }),
+      payload: expect.objectContaining({ members: [expect.objectContaining({ deviceName: "Alice" }), expect.objectContaining({ deviceId: "dev_2" })] }),
+    }));
+
+    const statusPromise = client.status();
+    MockWebSocket.instances[0]?.emitMessage({
+      id: "status_resp_1",
+      type: RelayEventType.StatusResponse,
+      channelId: "ch_1",
+      replyTo: "req_1",
+      payload: { status: "member", channelId: "ch_1", deviceId: "dev_1", ownerId: "dev_1" },
+    });
+
+    await expect(statusPromise).resolves.toEqual(expect.objectContaining({
+      responseEvent: expect.objectContaining({ type: RelayEventType.StatusResponse }),
+      payload: expect.objectContaining({ status: "member", deviceId: "dev_1" }),
+    }));
+  });
+
   it("updates pending connection state when join is approved", async () => {
     const client = new RelayClient(
       { relayHttpUrl: "http://relay.example", deviceName: "test-device" },

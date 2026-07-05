@@ -17,14 +17,27 @@ export interface PendingJoinRequest {
   receivedAt: string;
 }
 
+export interface PendingInboxItem {
+  id: string;
+  type: string;
+  from?: string;
+  to?: string;
+  channelId?: string;
+  message?: string;
+  receivedAt: string;
+  event?: unknown;
+}
+
 export interface PendingSnapshot {
   asks: PendingAsk[];
   joinRequests: PendingJoinRequest[];
+  inbox: PendingInboxItem[];
 }
 
 export class PendingState {
   private readonly asks = new Map<string, PendingAsk>();
   private readonly joinRequests = new Map<string, PendingJoinRequest>();
+  private readonly inbox = new Map<string, PendingInboxItem>();
 
   addAsk(ask: PendingAsk): PendingAsk {
     this.asks.set(ask.id, ask);
@@ -60,16 +73,31 @@ export class PendingState {
     return [...this.joinRequests.values()];
   }
 
+  addInbox(item: PendingInboxItem): PendingInboxItem {
+    this.inbox.set(item.id, item);
+    return item;
+  }
+
+  deleteInbox(id: string): boolean {
+    return this.inbox.delete(id);
+  }
+
+  listInbox(): PendingInboxItem[] {
+    return [...this.inbox.values()];
+  }
+
   snapshot(): PendingSnapshot {
     return {
       asks: this.listAsks(),
       joinRequests: this.listJoinRequests(),
+      inbox: this.listInbox(),
     };
   }
 
   clear(): void {
     this.asks.clear();
     this.joinRequests.clear();
+    this.inbox.clear();
   }
 }
 

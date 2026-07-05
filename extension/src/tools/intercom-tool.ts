@@ -1,10 +1,13 @@
 import {
   type ConnectResponse,
+  type ListMember,
+  type ListResponsePayload,
   type MessagePayload,
   type RelayEvent,
   RelayEventType,
+  type StatusResponsePayload,
 } from "../client/protocol.js";
-import { RelayClient, type ConnectOptions, type RelayClientState } from "../client/relay-client.js";
+import { RelayClient, type ConnectOptions, type RelayClientState, type RelayRequestResponse } from "../client/relay-client.js";
 import { PendingState, type PendingSnapshot } from "../state/pending.js";
 
 export type NotifyCallback = (message: string, event?: RelayEvent) => void | Promise<void>;
@@ -12,11 +15,11 @@ export type NotifyErrorCallback = (error: unknown, message: string, event?: Rela
 
 export interface RemoteIntercomClient {
   connect(channel: string, pin: string, options?: ConnectOptions): Promise<ConnectResponse>;
-  list(): RelayEvent;
+  list(): Promise<RelayRequestResponse<ListResponsePayload>>;
   send(to: string, message: string): RelayEvent<MessagePayload>;
   ask(to: string, message: string): RelayEvent<MessagePayload>;
   reply(replyTo: string, message: string): RelayEvent<MessagePayload>;
-  status(): RelayEvent;
+  status(): Promise<RelayRequestResponse<StatusResponsePayload>>;
   disconnect(code?: number, reason?: string): void;
   approveJoin(joinRequestId: string): RelayEvent;
   denyJoin(joinRequestId: string): RelayEvent;
@@ -59,7 +62,9 @@ export type RemoteIntercomToolInput =
 
 export type RemoteIntercomToolResult =
   | { ok: true; action: "connect"; response: ConnectResponse; connection: RelayClientState }
-  | { ok: true; action: "list" | "send" | "ask" | "reply" | "status" | "approve_join" | "deny_join"; event: RelayEvent; connection: RelayClientState }
+  | { ok: true; action: "list"; event: RelayEvent; responseEvent: RelayEvent<ListResponsePayload>; ownerId: string; members: ListMember[]; connection: RelayClientState }
+  | { ok: true; action: "status"; event: RelayEvent; responseEvent: RelayEvent<StatusResponsePayload>; status: StatusResponsePayload; connection: RelayClientState }
+  | { ok: true; action: "send" | "ask" | "reply" | "approve_join" | "deny_join"; event: RelayEvent; connection: RelayClientState }
   | { ok: true; action: "pending"; pending: PendingSnapshot }
   | { ok: true; action: "disconnect"; connection: RelayClientState };
 
@@ -118,8 +123,18 @@ export function createRemoteIntercomTool(options: CreateRemoteIntercomToolOption
         context.channelName = channel;
         return { ok: true, action: "connect", response, connection: connectionState(context.client) };
       }
-      case "list":
-        return { ok: true, action: "list", event: context.client.list(), connection: connectionState(context.client) };
+      case "list": {
+        const response = await context.client.list();
+        return {
+          ok: true,
+          action: "list",
+          event: response.requestEvent,
+          responseEvent: response.responseEvent,
+          ownerId: response.payload.ownerId,
+          members: response.payload.members,
+          connection: connectionState(context.client),
+        };
+      }
       case "send":
         return { ok: true, action: "send", event: context.client.send(input.to, input.message), connection: connectionState(context.client) };
       case "ask":
@@ -135,8 +150,17 @@ export function createRemoteIntercomTool(options: CreateRemoteIntercomToolOption
       }
       case "pending":
         return { ok: true, action: "pending", pending: context.pending.snapshot() };
-      case "status":
-        return { ok: true, action: "status", event: context.client.status(), connection: connectionState(context.client) };
+      case "status": {
+        const response = await context.client.status();
+        return {
+          ok: true,
+          action: "status",
+          event: response.requestEvent,
+          responseEvent: response.responseEvent,
+          status: response.payload,
+          connection: connectionState(context.client),
+        };
+      }
       case "disconnect":
         context.client.disconnect(input.code, input.reason);
         context.pending.clear();
@@ -187,14 +211,16 @@ function installRelayEventHandlers(context: ToolContext): () => void {
     if ((event.type !== RelayEventType.MessageAsk && payload?.kind !== "ask") || event.id === undefined || typeof payload?.text !== "string") {
       return;
     }
+    const receivedAt = new Date().toISOString();
     context.pending.addAsk({
       id: event.id,
       from: event.from,
       to: event.to,
       channelId: event.channelId,
       message: payload.text,
-      receivedAt: new Date().toISOString(),
+      receivedAt,
     });
+    addInboxEvent(context, event, payload.text, receivedAt);
     notify(context, `Device ${event.from ?? "unknown"} asks: ${payload.text}`, event);
   };
   const sendHandler = (event: RelayEvent): void => {
@@ -202,6 +228,7 @@ function installRelayEventHandlers(context: ToolContext): () => void {
     if (payload?.kind === "ask" || typeof payload?.text !== "string") {
       return;
     }
+    addInboxEvent(context, event, payload.text);
     notify(context, `Device ${event.from ?? "unknown"} says: ${payload.text}`, event);
   };
   const replyHandler = (event: RelayEvent): void => {
@@ -209,12 +236,25 @@ function installRelayEventHandlers(context: ToolContext): () => void {
     if (typeof payload?.text !== "string") {
       return;
     }
+    addInboxEvent(context, event, payload.text);
     notify(context, `Device ${event.from ?? "unknown"} replied: ${payload.text}`, event);
   };
   const disposeMessageAskCompatHandler = context.client.on(RelayEventType.MessageSend, askHandler);
   const disposeMessageSendHandler = context.client.on(RelayEventType.MessageSend, sendHandler);
   const disposeAskHandler = context.client.on(RelayEventType.MessageAsk, askHandler);
   const disposeReplyHandler = context.client.on(RelayEventType.MessageReply, replyHandler);
+
+  const disposeJoinApprovedHandler = context.client.on(RelayEventType.JoinApproved, (event) => {
+    addInboxEvent(context, event);
+    notify(context, `Join approved by ${event.from ?? "unknown"}.`, event);
+  });
+  const disposeJoinDeniedHandler = context.client.on(RelayEventType.JoinDenied, (event) => {
+    addInboxEvent(context, event);
+    notify(context, `Join denied by ${event.from ?? "unknown"}.`, event);
+  });
+  const disposeOwnerHandler = context.client.on("owner.changed", (event) => addInboxEvent(context, event));
+  const disposePresenceHandler = context.client.on("presence.changed", (event) => addInboxEvent(context, event));
+  const disposeErrorHandler = context.client.on(RelayEventType.Error, (event) => addInboxEvent(context, event));
 
   const disposeJoinHandler = context.client.on(RelayEventType.JoinRequest, (event) => {
     const payload = event.payload;
@@ -247,6 +287,11 @@ function installRelayEventHandlers(context: ToolContext): () => void {
     disposeMessageSendHandler();
     disposeAskHandler();
     disposeReplyHandler();
+    disposeJoinApprovedHandler();
+    disposeJoinDeniedHandler();
+    disposeOwnerHandler();
+    disposePresenceHandler();
+    disposeErrorHandler();
     disposeJoinHandler();
   };
 }
@@ -334,6 +379,19 @@ function connectionState(client: RemoteIntercomClient): RelayClientState {
     ...(client.channelId === undefined ? {} : { channelId: client.channelId }),
     ...(client.deviceId === undefined ? {} : { deviceId: client.deviceId }),
   };
+}
+
+function addInboxEvent(context: ToolContext, event: RelayEvent, message?: string, receivedAt = new Date().toISOString()): void {
+  context.pending.addInbox({
+    id: event.id ?? `${event.type}:${receivedAt}`,
+    type: event.type,
+    from: event.from,
+    to: event.to,
+    channelId: event.channelId,
+    message,
+    receivedAt,
+    event,
+  });
 }
 
 function notify(context: ToolContext, message: string, event: RelayEvent): void {

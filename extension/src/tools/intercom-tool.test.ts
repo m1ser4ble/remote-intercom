@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { RelayEventType, type ConnectResponse, type MessagePayload, type RelayEvent } from "../client/protocol.js";
+import { RelayEventType, type ConnectResponse, type ListResponsePayload, type MessagePayload, type RelayEvent, type StatusResponsePayload } from "../client/protocol.js";
 import { PendingState } from "../state/pending.js";
 import { createRemoteIntercomTool, type RemoteIntercomClient } from "./intercom-tool.js";
 
@@ -36,8 +36,20 @@ class MockClient implements RemoteIntercomClient {
     };
   }
 
-  list(): RelayEvent {
-    return this.record({ id: "evt_list", type: RelayEventType.ListRequest });
+  async list(): Promise<{ requestEvent: RelayEvent; responseEvent: RelayEvent<ListResponsePayload>; payload: ListResponsePayload }> {
+    const requestEvent = this.record({ id: "evt_list", type: RelayEventType.ListRequest });
+    const payload = {
+      ownerId: "dev_self",
+      members: [
+        { deviceId: "dev_self", deviceName: "agent", online: true, owner: true },
+        { deviceId: "dev_2", deviceName: "worker", online: true, owner: false },
+      ],
+    };
+    return {
+      requestEvent,
+      responseEvent: { id: "evt_list_response", type: RelayEventType.ListResponse, replyTo: "evt_list", payload },
+      payload,
+    };
   }
 
   send(to: string, message: string): RelayEvent<MessagePayload> {
@@ -52,8 +64,14 @@ class MockClient implements RemoteIntercomClient {
     return this.record({ id: "evt_reply", type: RelayEventType.MessageReply, replyTo, payload: { text: message, kind: "reply" } });
   }
 
-  status(): RelayEvent {
-    return this.record({ id: "evt_status", type: RelayEventType.StatusRequest });
+  async status(): Promise<{ requestEvent: RelayEvent; responseEvent: RelayEvent<StatusResponsePayload>; payload: StatusResponsePayload }> {
+    const requestEvent = this.record({ id: "evt_status", type: RelayEventType.StatusRequest });
+    const payload = { status: "member", channelId: "ch_1", deviceId: "dev_self", ownerId: "dev_self" };
+    return {
+      requestEvent,
+      responseEvent: { id: "evt_status_response", type: RelayEventType.StatusResponse, replyTo: "evt_status", payload },
+      payload,
+    };
   }
 
   disconnect(): void {
@@ -116,6 +134,8 @@ describe("remote intercom tool", () => {
       ok: true,
       action: "status",
       event: expect.objectContaining({ type: RelayEventType.StatusRequest }),
+      responseEvent: expect.objectContaining({ type: RelayEventType.StatusResponse }),
+      status: expect.objectContaining({ status: "member", deviceId: "dev_self" }),
       connection: expect.objectContaining({ channelId: "ch_1", status: "created" }),
     }));
     expect(client.sent).toEqual([
@@ -267,7 +287,7 @@ describe("remote intercom tool", () => {
     });
 
     await tool.execute({ action: "connect", channel: "other", pin: "1234" });
-    expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [] });
+    expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [], inbox: [] });
 
     pending.addAsk({ id: "ask_2", message: "still there?", receivedAt: "2026-01-01T00:00:00.000Z" });
     pending.addJoinRequest({
@@ -280,7 +300,7 @@ describe("remote intercom tool", () => {
     });
 
     await tool.execute({ action: "disconnect" });
-    expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [] });
+    expect(pending.snapshot()).toEqual({ asks: [], joinRequests: [], inbox: [] });
   });
 
   it("notifies inbound send and reply messages", () => {
@@ -306,6 +326,57 @@ describe("remote intercom tool", () => {
 
     expect(onNotify).toHaveBeenCalledWith("Device dev_2 says: hello", expect.objectContaining({ id: "msg_1" }));
     expect(onNotify).toHaveBeenCalledWith("Device dev_2 replied: yes", expect.objectContaining({ id: "reply_1" }));
+  });
+
+  it("returns list members from the relay response", async () => {
+    const client = new MockClient();
+    const tool = createRemoteIntercomTool({ client });
+    await tool.execute({ action: "connect", channel: "dwkim", pin: "1234" });
+
+    const listResult = await tool.execute({ action: "list" });
+
+    expect(listResult).toEqual(expect.objectContaining({
+      ok: true,
+      action: "list",
+      event: expect.objectContaining({ type: RelayEventType.ListRequest }),
+      responseEvent: expect.objectContaining({ type: RelayEventType.ListResponse }),
+      members: [
+        expect.objectContaining({ deviceId: "dev_self", deviceName: "agent", online: true, owner: true }),
+        expect.objectContaining({ deviceId: "dev_2", deviceName: "worker", online: true, owner: false }),
+      ],
+      ownerId: "dev_self",
+    }));
+  });
+
+  it("stores inbound messages and join approval events in the pending inbox", async () => {
+    const client = new MockClient();
+    const pending = new PendingState();
+    const tool = createRemoteIntercomTool({ client, pending });
+
+    client.emit({
+      id: "msg_1",
+      type: RelayEventType.MessageSend,
+      from: "dev_2",
+      to: "dev_self",
+      payload: { text: "hello", kind: "send" },
+    });
+    client.emit({
+      id: "approved_1",
+      type: RelayEventType.JoinApproved,
+      from: "dev_owner",
+      to: "dev_self",
+      payload: { joinRequestId: "join_1", deviceId: "dev_self" },
+    });
+
+    const pendingResult = await tool.execute({ action: "pending" });
+    expect(pendingResult.action).toBe("pending");
+    if (pendingResult.action !== "pending") {
+      throw new Error("expected pending result");
+    }
+    expect(pendingResult.pending.inbox).toEqual([
+      expect.objectContaining({ id: "msg_1", type: RelayEventType.MessageSend, from: "dev_2", message: "hello" }),
+      expect.objectContaining({ id: "approved_1", type: RelayEventType.JoinApproved, from: "dev_owner" }),
+    ]);
   });
 
   it("stores inbound asks and removes them when replied to", async () => {
