@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: remote-intercom-relay
+  namespace: remote-intercom
+spec:
+  selector:
+    app: remote-intercom-relay
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

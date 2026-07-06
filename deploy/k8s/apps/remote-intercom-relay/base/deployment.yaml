@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remote-intercom-relay
+  namespace: remote-intercom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: remote-intercom-relay
+  template:
+    metadata:
+      labels:
+        app: remote-intercom-relay
+        app.kubernetes.io/name: remote-intercom-relay
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: rpi4nc
+      containers:
+        - name: relay
+          image: ghcr.io/m1ser4ble/remote-intercom-relay:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RELAY_ADDR
+              value: ":8080"
+            - name: RELAY_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: remote-intercom-relay-secret
+                  key: relay-token-secret
+            - name: RELAY_EXTENSION_BUNDLE
+              value: /bundle/remote-intercom-extension.mjs
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

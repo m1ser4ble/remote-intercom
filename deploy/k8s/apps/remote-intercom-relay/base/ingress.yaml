@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: remote-intercom-relay
+  namespace: remote-intercom
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-dev-prod
+    ingress.cilium.io/force-https: disabled
+spec:
+  ingressClassName: cilium
+  rules:
+    - host: intercom.samplingcloud.top
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: remote-intercom-relay
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - intercom.samplingcloud.top
+      secretName: intercom-samplingcloud-top-tls
