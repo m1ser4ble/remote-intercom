@@ -6,6 +6,8 @@ on:
       - main
     tags:
       - "v*.*.*"
+    paths-ignore:
+      - "deploy/k8s/**"
   workflow_dispatch:
 
 permissions:
