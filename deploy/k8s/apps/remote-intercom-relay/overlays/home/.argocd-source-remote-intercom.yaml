@@ -1,3 +1,3 @@
 kustomize:
   images:
-  - ghcr.io/m1ser4ble/remote-intercom-relay:sha-785edf3
+  - ghcr.io/m1ser4ble/remote-intercom-relay:sha-5479bf0
