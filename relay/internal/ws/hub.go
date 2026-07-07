@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -105,8 +106,10 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if previous != nil {
+		log.Printf("remote-intercom websocket superseding previous connection channel=%s device=%s role=%s", client.channelID, client.deviceID, client.role)
 		_ = previous.close(websocket.StatusPolicyViolation, "connection superseded")
 	}
+	log.Printf("remote-intercom websocket connected channel=%s device=%s role=%s joinRequest=%s", client.channelID, client.deviceID, client.role, client.joinRequestID)
 	defer h.unregister(client)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
@@ -121,6 +124,8 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		messageType, data, err := conn.Read(context.Background())
 		if err != nil {
+			status := websocket.CloseStatus(err)
+			log.Printf("remote-intercom websocket read closed channel=%s device=%s role=%s closeStatus=%d err=%v", client.channelID, client.deviceID, client.role, status, err)
 			return
 		}
 		if messageType != websocket.MessageText {
@@ -591,7 +596,10 @@ func (h *Hub) unregister(c *connection) {
 		}
 	}
 	if removedMember {
+		log.Printf("remote-intercom websocket disconnected channel=%s device=%s role=%s reconnectGrace=%s", c.channelID, c.deviceID, c.role, h.reconnectGrace)
 		h.startOfflineTimerLocked(c.channelID, c.deviceID)
+	} else if c.role == auth.RolePending {
+		log.Printf("remote-intercom pending websocket disconnected channel=%s device=%s joinRequest=%s", c.channelID, c.deviceID, c.joinRequestID)
 	}
 	h.mu.Unlock()
 }
@@ -681,12 +689,15 @@ func (h *Hub) expireOfflineMember(channelID, deviceID string) {
 
 	change, err := h.registry.ExpireOfflineMember(channelID, deviceID)
 	if err != nil {
+		log.Printf("remote-intercom offline expiry skipped channel=%s device=%s err=%v", channelID, deviceID, err)
 		return
 	}
 	if change.Deleted {
+		log.Printf("remote-intercom channel expired after offline grace channel=%s device=%s", channelID, deviceID)
 		h.closePendingForChannel(channelID)
 		return
 	}
+	log.Printf("remote-intercom member marked offline channel=%s device=%s owner=%s", channelID, deviceID, change.CurrentOwnerID)
 	h.emitPresenceChange(change, deviceID)
 }
 
@@ -836,6 +847,7 @@ func (c *connection) heartbeat(done <-chan struct{}) {
 			err := c.conn.Ping(ctx)
 			cancel()
 			if err != nil {
+				log.Printf("remote-intercom websocket heartbeat failed channel=%s device=%s role=%s timeout=%s err=%v", c.channelID, c.deviceID, c.role, heartbeatTimeout, err)
 				_ = c.conn.Close(websocket.StatusPolicyViolation, "heartbeat failed")
 				return
 			}

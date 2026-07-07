@@ -370,17 +370,28 @@ export class RelayClient {
         const data = messageData(first);
         this.handleSocketMessage(data);
       };
-      const closeHandler = (): void => {
+      const closeHandler = (first: unknown): void => {
         if (!isCurrentSocket()) {
           return;
         }
+        const closeInfo = closeEventInfo(first);
         if (!settled) {
-          rejectBeforeOpen(new RelayClientError("relay WebSocket closed before opening"));
+          rejectBeforeOpen(new RelayClientError(`relay WebSocket closed before opening${closeInfo.summary}`));
           return;
         }
+        const willReconnect = !this.explicitDisconnect && !this.suppressReconnectForSocket.has(socket) && this.isEstablishedMemberConnection();
+        this.emitError("websocket_close", new Error(closeInfo.message), {
+          closeCode: closeInfo.code,
+          reason: closeInfo.reason,
+          wasClean: closeInfo.wasClean,
+          willReconnect,
+          deviceId: this.state.deviceId,
+          channelId: this.state.channelId,
+          status: this.state.status,
+        });
         this.socket = undefined;
         cleanup();
-        if (!this.explicitDisconnect && !this.suppressReconnectForSocket.has(socket) && this.isEstablishedMemberConnection()) {
+        if (willReconnect) {
           this.scheduleReconnect();
         }
       };
@@ -442,8 +453,16 @@ export class RelayClient {
     if (this.reconnectTimer !== undefined || this.lastConnectArgs === undefined) {
       return;
     }
+    const attempt = this.reconnectAttempt + 1;
     const delay = Math.min(this.reconnectDelayMs * (2 ** this.reconnectAttempt), 5_000);
-    this.reconnectAttempt += 1;
+    this.reconnectAttempt = attempt;
+    this.emitError("reconnect_scheduled", `scheduled reconnect attempt ${attempt} in ${delay}ms`, {
+      attempt,
+      delayMs: delay,
+      deviceId: this.state.deviceId,
+      channelId: this.state.channelId,
+      status: this.state.status,
+    });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
       void this.reconnect();
@@ -649,6 +668,25 @@ function combineCleanups(...cleanups: Array<() => void>): () => void {
 
 function socketErrorToRelayClientError(error: unknown): RelayClientError {
   return new RelayClientError(`relay WebSocket error before opening: ${errorMessage(error)}`, undefined, error);
+}
+
+function closeEventInfo(event: unknown): { code?: number; reason?: string; wasClean?: boolean; message: string; summary: string } {
+  const code = isRecord(event) && typeof event.code === "number" ? event.code : undefined;
+  const reason = isRecord(event) && typeof event.reason === "string" ? event.reason : undefined;
+  const wasClean = isRecord(event) && typeof event.wasClean === "boolean" ? event.wasClean : undefined;
+  const parts = [
+    code === undefined ? undefined : `code=${code}`,
+    reason === undefined || reason === "" ? undefined : `reason=${reason}`,
+    wasClean === undefined ? undefined : `wasClean=${wasClean}`,
+  ].filter((part): part is string => part !== undefined);
+  const detail = parts.join(" ");
+  return {
+    code,
+    reason,
+    wasClean,
+    message: detail === "" ? "websocket closed" : `websocket closed ${detail}`,
+    summary: detail === "" ? "" : ` (${detail})`,
+  };
 }
 
 function errorMessage(error: unknown): string {

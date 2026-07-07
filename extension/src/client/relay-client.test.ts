@@ -22,9 +22,9 @@ class MockWebSocket implements WebSocketLike {
     this.sent.push(data);
   }
 
-  close(): void {
+  close(code = 1000, reason = ""): void {
     this.readyState = 3;
-    this.emit("close");
+    this.emit("close", { code, reason, wasClean: code === 1000 });
   }
 
   on(event: MockWebSocketEvent, handler: (...args: unknown[]) => void): void {
@@ -434,6 +434,58 @@ describe("RelayClient", () => {
       expect.objectContaining({ id: "evt_1", type: RelayEventType.JoinApprove, channelId: "ch_1", payload: { joinRequestId: "join_alias_1" } }),
       expect.objectContaining({ id: "evt_2", type: RelayEventType.JoinDeny, channelId: "ch_1", payload: { joinRequestId: "join_alias_2" } }),
     ]);
+  });
+
+  it("emits diagnostic events when an established member socket closes and schedules reconnect", async () => {
+    vi.useFakeTimers();
+    const errorHandler = vi.fn();
+    let connectCount = 0;
+    const fetchImpl = vi.fn<FetchLike>(async () => {
+      connectCount += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => connectPayload({ token: `token_${connectCount}` }),
+      };
+    });
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: fetchImpl, WebSocket: MockWebSocket, reconnectDelayMs: 5 },
+    );
+    client.on(RelayEventType.Error, errorHandler);
+
+    try {
+      await connectAndOpen(client);
+      MockWebSocket.instances[0]?.close(1006, "network gone");
+
+      expect(errorHandler).toHaveBeenCalledWith(expect.objectContaining({
+        type: RelayEventType.Error,
+        payload: expect.objectContaining({
+          code: "websocket_close",
+          closeCode: 1006,
+          reason: "network gone",
+          willReconnect: true,
+          deviceId: "dev_1",
+          channelId: "ch_1",
+        }),
+      }));
+      expect(errorHandler).toHaveBeenCalledWith(expect.objectContaining({
+        type: RelayEventType.Error,
+        payload: expect.objectContaining({
+          code: "reconnect_scheduled",
+          attempt: 1,
+          delayMs: 5,
+          deviceId: "dev_1",
+          channelId: "ch_1",
+        }),
+      }));
+
+      await vi.advanceTimersByTimeAsync(5);
+      await flushPromises();
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reconnects an established member socket after close", async () => {
