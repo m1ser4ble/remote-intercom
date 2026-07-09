@@ -276,7 +276,7 @@ func TestDuplicateMemberConnectionRevokesOldConnection(t *testing.T) {
 	assertNoEvent(t, bobWS, 200*time.Millisecond)
 }
 
-func TestLastMemberDisconnectGraceDeletesChannel(t *testing.T) {
+func TestLastMemberDisconnectGracePreservesChannelMembership(t *testing.T) {
 	fixture := newRelayFixture(t, 25*time.Millisecond)
 	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
 	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
@@ -284,11 +284,18 @@ func TestLastMemberDisconnectGraceDeletesChannel(t *testing.T) {
 	if err := aliceWS.Close(websocket.StatusNormalClosure, "disconnect alice"); err != nil {
 		t.Fatal(err)
 	}
-	waitForCondition(t, func() bool { return fixture.registry.Channel(alice.ChannelID) == nil })
+	waitForCondition(t, func() bool {
+		ch := fixture.registry.Channel(alice.ChannelID)
+		if ch == nil {
+			return false
+		}
+		member, ok := ch.Members["dev_alice"]
+		return ok && !member.Online && ch.CurrentOwnerID == ""
+	})
 
 	fresh := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
-	if fresh.Status != string(channel.StatusCreated) {
-		t.Fatalf("fresh status = %q, want %q", fresh.Status, channel.StatusCreated)
+	if fresh.Status != string(channel.StatusConnected) {
+		t.Fatalf("fresh status = %q, want %q", fresh.Status, channel.StatusConnected)
 	}
 }
 

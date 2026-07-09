@@ -230,7 +230,7 @@ func (r *Registry) ExpireOfflineMember(channelID, deviceID string) (*PresenceCha
 	if !ok {
 		return nil, fmt.Errorf("channel %q not found", channelID)
 	}
-	return r.setOnlineLocked(ch, deviceID, false, true)
+	return r.setOnlineLocked(ch, deviceID, false, false)
 }
 
 func (r *Registry) setOnlineLocked(ch *Channel, deviceID string, online, deleteIfEmpty bool) (*PresenceChange, error) {

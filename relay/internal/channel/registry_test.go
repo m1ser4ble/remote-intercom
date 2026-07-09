@@ -284,7 +284,7 @@ func TestReconnectAdmittedDeviceRestoresOwnerWhenWebSocketConnects(t *testing.T)
 	}
 }
 
-func TestExpireLastOfflineMemberDeletesChannelKey(t *testing.T) {
+func TestExpireLastOfflineMemberPreservesChannelMembership(t *testing.T) {
 	r := NewRegistry()
 	created := r.Connect("dwkim", "1234", "dev_a", "macbook")
 	if err := r.SetOnline(created.Channel.ID, "dev_a", true); err != nil {
@@ -294,15 +294,23 @@ func TestExpireLastOfflineMemberDeletesChannelKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !change.Deleted {
-		t.Fatal("expected channel deletion")
+	if change.Deleted {
+		t.Fatal("channel should be retained when the last websocket disconnects")
 	}
-	if ch := r.Channel(created.Channel.ID); ch != nil {
-		t.Fatalf("channel remains after deletion: %+v", ch)
+	ch := r.Channel(created.Channel.ID)
+	if ch == nil {
+		t.Fatal("channel missing after last member went offline")
+	}
+	member, ok := ch.Members["dev_a"]
+	if !ok {
+		t.Fatal("member record missing after websocket disconnect")
+	}
+	if member.Online {
+		t.Fatal("member should be marked offline after reconnect grace")
 	}
 	fresh := r.Connect("dwkim", "1234", "dev_a", "macbook")
-	if fresh.Status != StatusCreated {
-		t.Fatalf("fresh status = %s, want %s", fresh.Status, StatusCreated)
+	if fresh.Status != StatusConnected {
+		t.Fatalf("fresh status = %s, want %s", fresh.Status, StatusConnected)
 	}
 }
 
