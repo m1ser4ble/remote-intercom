@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -210,6 +211,48 @@ func TestPendingConnectionCannotRouteMessages(t *testing.T) {
 	}
 }
 
+func TestRelayRejectsRoutedFrameThatExceedsWireLimitAfterNormalization(t *testing.T) {
+	fixture := newRelayFixture(t, 50*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+	bob := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
+	_ = readEventOfType(t, aliceWS, "join.request", nil)
+	writeEvent(t, aliceWS, protocol.Event{ID: "approve-near-limit", Type: "join.approve", Payload: map[string]any{"joinRequestId": bob.JoinRequestID}})
+	_ = readEventOfType(t, bobWS, "join.approved", nil)
+	_ = readEventOfType(t, aliceWS, "join.decision.ack", nil)
+	_ = readEventOfType(t, aliceWS, "presence.changed", nil)
+
+	event := protocol.Event{
+		ID: "near-limit", Type: "message.send", To: "dev_bob",
+		Payload: map[string]any{"kind": "send", "text": ""},
+	}
+	base, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wireLimit = 64 * 1024
+	event.Payload["text"] = strings.Repeat("x", wireLimit-len(base))
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != wireLimit {
+		t.Fatalf("encoded bytes = %d, want %d", len(encoded), wireLimit)
+	}
+	if err := aliceWS.Write(context.Background(), websocket.MessageText, encoded); err != nil {
+		t.Fatal(err)
+	}
+
+	response := readEvent(t, aliceWS)
+	if response.Type != "error" || response.ReplyTo != "near-limit" {
+		t.Fatalf("response = type %q replyTo %q, want correlated error", response.Type, response.ReplyTo)
+	}
+	if got := stringPayload(t, response.Payload, "code"); got != "target_unreachable" {
+		t.Fatalf("error code = %q, want target_unreachable", got)
+	}
+}
+
 func TestUnknownTargetReturnsCorrelatedErrorWithoutAck(t *testing.T) {
 	fixture := newRelayFixture(t, 50*time.Millisecond)
 	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
@@ -359,6 +402,16 @@ func TestLastMemberDisconnectGraceDeletesChannel(t *testing.T) {
 	if fresh.Status != string(channel.StatusCreated) {
 		t.Fatalf("fresh status = %q, want %q", fresh.Status, channel.StatusCreated)
 	}
+}
+
+func TestCreatorThatNeverOpensWebSocketExpiresAndClosesPendingConnection(t *testing.T) {
+	fixture := newRelayFixture(t, 25*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	bob := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
+
+	waitForCondition(t, func() bool { return fixture.registry.Channel(alice.ChannelID) == nil })
+	assertCloseStatus(t, bobWS, websocket.StatusPolicyViolation)
 }
 
 func TestLastMemberExpiryClosesPendingConnection(t *testing.T) {

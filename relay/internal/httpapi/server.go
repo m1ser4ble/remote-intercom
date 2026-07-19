@@ -206,6 +206,9 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		DeviceID:  request.DeviceID,
 		WSURL:     publicWSURL,
 	}
+	if result.Status == channel.StatusCreated && s.Hub != nil {
+		s.Hub.ScheduleOfflineExpiry(response.ChannelID, response.DeviceID)
+	}
 
 	switch result.Status {
 	case channel.StatusCreated, channel.StatusConnected:
@@ -225,7 +228,6 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not issue token")
 		return
 	}
-
 	writeJSON(w, http.StatusOK, response)
 }
 

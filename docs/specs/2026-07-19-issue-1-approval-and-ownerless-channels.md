@@ -56,6 +56,8 @@ cd extension && npm run build:bundle
 
 `ExpireOfflineMember` deletes the channel when recomputing ownership leaves no online owner. Deletion removes the channel key and membership history. The hub closes pending sockets for the deleted channel with a clear channel-deleted reason.
 
+A newly created member that never opens its WebSocket receives the same reconnect-grace window. Opening the member socket cancels that timer; otherwise the ownerless channel expires instead of trapping later joiners.
+
 Reconnect before grace expiry cancels deletion and preserves existing priority. Reconnect after deletion follows first-connect behavior and creates a new channel.
 
 ### Pending permissions
@@ -119,7 +121,8 @@ Follow RED → GREEN → REFACTOR for each behavior:
 4. Add relay tests for successful approval and denial ACKs.
 5. Add extension tests proving decision tools remain pending until ACK.
 6. Add extension tests proving correlated error and timeout retain local pending state.
-7. Keep normal approval, failover, and reconnect-within-grace tests green.
+7. Prove a creator that never opens its WebSocket expires after the existing grace and closes pending sockets.
+8. Keep normal approval, failover, and reconnect-within-grace tests green.
 
 Tests assert externally visible state and events, not helper call order.
 

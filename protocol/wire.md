@@ -98,7 +98,7 @@ Connect to `wsUrl` with either:
 - `Authorization: Bearer <token>`
 - `?token=<token>` query parameter
 
-All frames are UTF-8 JSON text. The complete serialized frame, including the event envelope, must not exceed 65,536 bytes. Clients reject oversized outbound events before socket write; the relay read limit remains defense in depth.
+All frames are UTF-8 JSON text. The complete serialized frame, including the event envelope, must not exceed 65,536 bytes. Clients reject oversized outbound events before socket write. The relay enforces the same limit both when reading client frames and after adding routing fields, before writing to the target socket.
 
 ```json
 {

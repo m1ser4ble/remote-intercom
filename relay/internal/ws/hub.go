@@ -56,6 +56,17 @@ func (h *Hub) SetReconnectGrace(duration time.Duration) {
 	h.reconnectGrace = duration
 }
 
+// ScheduleOfflineExpiry applies reconnect grace to a newly-created member
+// that has not opened its WebSocket yet. Registration cancels the timer.
+func (h *Hub) ScheduleOfflineExpiry(channelID, deviceID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.members[channelID] != nil && h.members[channelID][deviceID] != nil {
+		return
+	}
+	h.startOfflineTimerLocked(channelID, deviceID)
+}
+
 // ServeHTTP authenticates and accepts a WebSocket connection.
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -716,9 +727,10 @@ func (h *Hub) expireOfflineMember(channelID, deviceID string) {
 		h.mu.Unlock()
 		return
 	}
-	h.mu.Unlock()
-
+	// Keep hub membership and registry expiry atomic so a reconnect cannot
+	// register between the final live-connection check and channel deletion.
 	change, err := h.registry.ExpireOfflineMember(channelID, deviceID)
+	h.mu.Unlock()
 	if err != nil {
 		log.Printf("remote-intercom offline expiry skipped channel=%s device=%s err=%v", channelID, deviceID, err)
 		return
@@ -838,6 +850,9 @@ func (c *connection) writeEvent(event protocol.Event) error {
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
+	}
+	if len(data) > DefaultMaxMessageBytes {
+		return errors.New("event exceeds maximum message size")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { RelayClient, type FetchLike, type WebSocketLike } from "./relay-client.js";
+import { RelayClient, type FetchLike, type FetchResponseLike, type WebSocketLike } from "./relay-client.js";
 import { RelayEventType, type ConnectResponse, type RelayEvent } from "./protocol.js";
 
 type MockWebSocketEvent = "open" | "message" | "close" | "error";
@@ -89,6 +89,16 @@ function connectPayload(overrides: Partial<ConnectResponse> = {}): ConnectRespon
     wsUrl: "ws://relay.example/ws",
     ...overrides,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 function mockFetch(payload: unknown, init: { ok?: boolean; status?: number; statusText?: string } = {}): FetchLike {
@@ -378,6 +388,20 @@ describe("RelayClient", () => {
     }));
   });
 
+  it("returns frame validation failures as rejected promises", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => "msg_1" },
+    );
+    await connectAndOpen(client);
+
+    let operation: ReturnType<RelayClient["send"]> | undefined;
+    expect(() => {
+      operation = client.send("dev_2", "한".repeat(30_000));
+    }).not.toThrow();
+    await expect(operation).rejects.toMatchObject({ code: "message_too_large" });
+  });
+
   it("rejects an oversized serialized UTF-8 frame before socket write", async () => {
     const client = new RelayClient(
       { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
@@ -464,6 +488,32 @@ describe("RelayClient", () => {
       payload: { code: "unknown_target", message: "target is not online" },
     });
     await expect(result).rejects.toMatchObject({ code: "unknown_target" });
+  });
+
+  it("rejects mismatched message and join decision acknowledgements", async () => {
+    let sequence = 0;
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => `evt_${++sequence}` },
+    );
+    await connectAndOpen(client);
+    const socket = MockWebSocket.instances[0];
+
+    const sendPromise = client.send("dev_2", "hello");
+    socket?.emitMessage({
+      type: RelayEventType.MessageAck,
+      replyTo: "evt_1",
+      payload: { status: "delivered", deviceId: "" },
+    });
+    await expect(sendPromise).rejects.toMatchObject({ code: "invalid_response" });
+
+    const decisionPromise = client.approve("join_1");
+    socket?.emitMessage({
+      type: RelayEventType.JoinDecisionAck,
+      replyTo: "evt_2",
+      payload: { joinRequestId: "join_1", deviceId: "dev_2", decision: "denied" },
+    });
+    await expect(decisionPromise).rejects.toMatchObject({ code: "invalid_response" });
   });
 
   it("reports delivery unknown without replaying after ack timeout", async () => {
@@ -611,6 +661,33 @@ describe("RelayClient", () => {
     }
   });
 
+  it("schedules heartbeat from the latest inbound activity", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new RelayClient(
+        { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+        { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => "heartbeat_1" },
+      );
+      await connectAndOpen(client);
+      const socket = MockWebSocket.instances[0];
+
+      await vi.advanceTimersByTimeAsync(24_000);
+      socket?.emitMessage({ type: "presence.changed", payload: { deviceId: "dev_2", online: true } });
+      await vi.advanceTimersByTimeAsync(24_999);
+      expect(socket?.sent).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(JSON.parse(socket?.sent.at(-1) ?? "{}")).toEqual(expect.objectContaining({ type: RelayEventType.StatusRequest }));
+      socket?.emitMessage({
+        type: RelayEventType.StatusResponse,
+        replyTo: "heartbeat_1",
+        payload: { status: "member", channelId: "ch_1", deviceId: "dev_1", ownerId: "dev_1" },
+      });
+      client.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reconnects a pending half-open socket after heartbeat timeout", async () => {
     vi.useFakeTimers();
     try {
@@ -628,12 +705,24 @@ describe("RelayClient", () => {
       await vi.advanceTimersByTimeAsync(5_000);
       await flushPromises();
 
+      expect(MockWebSocket.instances).toHaveLength(1);
+      expect(client.connectState).toEqual(expect.objectContaining({
+        transportStatus: "reconnecting",
+        lastRelayActivityAt: expect.any(String),
+        lastDisconnectedAt: expect.any(String),
+        reconnectAttempt: 1,
+      }));
+      await vi.advanceTimersByTimeAsync(249);
+      expect(MockWebSocket.instances).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await flushPromises();
       expect(MockWebSocket.instances).toHaveLength(2);
       const replacement = MockWebSocket.instances[1];
       replacement?.emitOpen();
       await flushPromises();
 
       expect(client.currentStatus).toBe("pending_approval");
+      expect(client.connectState.transportStatus).toBe("connected");
       expect(diagnostics).toEqual(expect.arrayContaining(["heartbeat_timeout", "reconnect_attempt", "reconnect_success"]));
     } finally {
       vi.useRealTimers();
@@ -654,6 +743,7 @@ describe("RelayClient", () => {
       const sendPromise = client.send("dev_2", "hello");
       const askPromise = client.ask("dev_2", "question?");
       await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(250);
       await flushPromises();
 
       expect(MockWebSocket.instances).toHaveLength(2);
@@ -669,6 +759,149 @@ describe("RelayClient", () => {
       replacement?.emitMessage({ type: "message.ack", replyTo: ask?.id, payload: { status: "delivered", deviceId: "dev_2" } });
       await Promise.all([sendPromise, askPromise]);
       expect(MockWebSocket.instances).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let an old heartbeat timeout close a replacement socket", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new RelayClient(
+        { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+        { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket },
+      );
+      await connectAndOpen(client);
+      const original = MockWebSocket.instances[0];
+      await vi.advanceTimersByTimeAsync(25_000);
+      original?.close(1006, "network gone during heartbeat");
+      await vi.advanceTimersByTimeAsync(250);
+      await flushPromises();
+
+      const replacement = MockWebSocket.instances[1];
+      expect(replacement).toBeDefined();
+      replacement?.emitOpen();
+      await flushPromises();
+      await vi.advanceTimersByTimeAsync(4_750);
+      await flushPromises();
+
+      expect(replacement?.readyState).toBe(1);
+      expect(MockWebSocket.instances).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a manual connect fences the old socket and heartbeat before bootstrap", async () => {
+    vi.useFakeTimers();
+    try {
+      const manualBootstrap = deferred<FetchResponseLike>();
+      let fetchCount = 0;
+      const fetchImpl = vi.fn<FetchLike>(() => {
+        fetchCount += 1;
+        if (fetchCount === 1) {
+          return Promise.resolve({ ok: true, status: 200, json: async () => connectPayload() });
+        }
+        return manualBootstrap.promise;
+      });
+      const client = new RelayClient(
+        { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+        { fetch: fetchImpl, WebSocket: MockWebSocket },
+      );
+      await connectAndOpen(client);
+      const original = MockWebSocket.instances[0];
+      await vi.advanceTimersByTimeAsync(25_000);
+
+      const manualConnect = client.connect("new-channel", "9999");
+      expect(original?.readyState).toBe(3);
+      manualBootstrap.resolve({
+        ok: true,
+        status: 200,
+        json: async () => connectPayload({ channelId: "ch_new", token: "new_token" }),
+      });
+      await flushPromises();
+      const replacement = MockWebSocket.instances[1];
+      replacement?.emitOpen();
+      await manualConnect;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushPromises();
+
+      expect(replacement?.readyState).toBe(1);
+      expect(MockWebSocket.instances).toHaveLength(2);
+      expect(client.channelId).toBe("ch_new");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a manual connect cancels an older reconnect loop", async () => {
+    vi.useFakeTimers();
+    try {
+      const manualBootstrap = deferred<FetchResponseLike>();
+      let fetchCount = 0;
+      const fetchImpl = vi.fn<FetchLike>(() => {
+        fetchCount += 1;
+        if (fetchCount === 1) {
+          return Promise.resolve({ ok: true, status: 200, json: async () => connectPayload() });
+        }
+        if (fetchCount === 2) {
+          return manualBootstrap.promise;
+        }
+        return Promise.resolve({ ok: true, status: 200, json: async () => connectPayload({ channelId: "ch_old" }) });
+      });
+      const client = new RelayClient(
+        { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+        { fetch: fetchImpl, WebSocket: MockWebSocket },
+      );
+      await connectAndOpen(client);
+      MockWebSocket.instances[0]?.close(1006, "network gone");
+
+      const manualConnect = client.connect("new-channel", "9999");
+      await flushPromises();
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      manualBootstrap.resolve({
+        ok: true,
+        status: 200,
+        json: async () => connectPayload({ channelId: "ch_new", token: "new_token" }),
+      });
+      await flushPromises();
+      expect(MockWebSocket.instances).toHaveLength(2);
+      MockWebSocket.instances[1]?.emitOpen();
+      await expect(manualConnect).resolves.toEqual(expect.objectContaining({ channelId: "ch_new" }));
+      expect(client.channelId).toBe("ch_new");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("explicit disconnect cancels an in-flight reconnect bootstrap", async () => {
+    vi.useFakeTimers();
+    try {
+      const reconnectBootstrap = deferred<FetchResponseLike>();
+      let fetchCount = 0;
+      const fetchImpl = vi.fn<FetchLike>(() => {
+        fetchCount += 1;
+        if (fetchCount === 1) {
+          return Promise.resolve({ ok: true, status: 200, json: async () => connectPayload() });
+        }
+        return reconnectBootstrap.promise;
+      });
+      const client = new RelayClient(
+        { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+        { fetch: fetchImpl, WebSocket: MockWebSocket, reconnectDelayMs: 5 },
+      );
+      await connectAndOpen(client);
+      MockWebSocket.instances[0]?.close(1006, "network gone");
+      await vi.advanceTimersByTimeAsync(5);
+      await flushPromises();
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+
+      client.disconnect();
+      reconnectBootstrap.resolve({ ok: true, status: 200, json: async () => connectPayload({ token: "late_token" }) });
+      await flushPromises();
+
+      expect(MockWebSocket.instances).toHaveLength(1);
+      expect(client.connectState).toEqual(expect.objectContaining({ transportStatus: "disconnected" }));
     } finally {
       vi.useRealTimers();
     }

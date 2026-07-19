@@ -34,7 +34,7 @@ cd extension && npm run build:bundle
 ## Reliability invariants
 
 - The relay is ephemeral and in-memory. It is not a durable message broker.
-- When the last online member exceeds reconnect grace, delete the channel and its membership history.
+- When the last online member exceeds reconnect grace, delete the channel and its membership history. Apply the same grace to a creator that never opens its WebSocket.
 - Pending devices may request status and receive join decisions. They may not list members, send messages, or decide joins.
 - `send`, `ask`, and `reply` succeed only after a correlated `message.ack` confirms a successful target WebSocket write.
 - A message ACK does not mean that the target user or agent processed the message.

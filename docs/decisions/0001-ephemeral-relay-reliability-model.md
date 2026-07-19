@@ -24,7 +24,7 @@ The relay must become reliable enough for live coordination without acquiring th
 
 Keep Remote Intercom ephemeral and non-durable, with these guarantees:
 
-1. **Channel lifecycle** — reconnect grace remains 30 seconds. When the final online member exceeds grace, delete the channel, membership history, and pending joins. The next connection for the same name and PIN creates a new channel and owner.
+1. **Channel lifecycle** — reconnect grace remains 30 seconds. When the final online member exceeds grace, delete the channel, membership history, and pending joins. Apply that same grace to a newly created member that never opens its WebSocket, rather than adding a second dormant-channel policy. The next connection for the same name and PIN creates a new channel and owner.
 2. **Join authorization** — pending devices may request their status and receive approval or denial. They may not list members, send messages, or decide joins.
 3. **Message success** — `send`, `ask`, and `reply` succeed only after the relay writes the event to the target WebSocket and returns a correlated `message.ack`.
 4. **Join-decision success** — approval and denial succeed only after the relay applies the decision and returns a correlated `join.decision.ack`.
