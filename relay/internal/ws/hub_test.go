@@ -188,6 +188,31 @@ func TestPendingConnectionCannotRouteMessages(t *testing.T) {
 	}
 }
 
+func TestPendingConnectionCanRequestStatusButCannotListMembers(t *testing.T) {
+	fixture := newRelayFixture(t, 50*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+	bob := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
+	_ = readEventOfType(t, aliceWS, "join.request", nil)
+
+	writeEvent(t, bobWS, protocol.Event{ID: "pending-status", Type: "status.request"})
+	status := readEventOfType(t, bobWS, "status.response", func(event protocol.Event) bool {
+		return event.ReplyTo == "pending-status"
+	})
+	if got := stringPayload(t, status.Payload, "status"); got != "pending_approval" {
+		t.Fatalf("status = %q, want pending_approval", got)
+	}
+
+	writeEvent(t, bobWS, protocol.Event{ID: "pending-list", Type: "list.request"})
+	denied := readEventOfType(t, bobWS, "error", func(event protocol.Event) bool {
+		return event.ReplyTo == "pending-list"
+	})
+	if got := stringPayload(t, denied.Payload, "code"); got != "unauthorized" {
+		t.Fatalf("error code = %q, want unauthorized", got)
+	}
+}
+
 func TestOversizedWebSocketMessageIsRejected(t *testing.T) {
 	server := newRelayFixture(t, 50*time.Millisecond).server
 	alice := postConnect(t, server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
@@ -276,7 +301,7 @@ func TestDuplicateMemberConnectionRevokesOldConnection(t *testing.T) {
 	assertNoEvent(t, bobWS, 200*time.Millisecond)
 }
 
-func TestLastMemberDisconnectGracePreservesChannelMembership(t *testing.T) {
+func TestLastMemberDisconnectGraceDeletesChannel(t *testing.T) {
 	fixture := newRelayFixture(t, 25*time.Millisecond)
 	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
 	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
@@ -284,19 +309,27 @@ func TestLastMemberDisconnectGracePreservesChannelMembership(t *testing.T) {
 	if err := aliceWS.Close(websocket.StatusNormalClosure, "disconnect alice"); err != nil {
 		t.Fatal(err)
 	}
-	waitForCondition(t, func() bool {
-		ch := fixture.registry.Channel(alice.ChannelID)
-		if ch == nil {
-			return false
-		}
-		member, ok := ch.Members["dev_alice"]
-		return ok && !member.Online && ch.CurrentOwnerID == ""
-	})
+	waitForCondition(t, func() bool { return fixture.registry.Channel(alice.ChannelID) == nil })
 
 	fresh := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
-	if fresh.Status != string(channel.StatusConnected) {
-		t.Fatalf("fresh status = %q, want %q", fresh.Status, channel.StatusConnected)
+	if fresh.Status != string(channel.StatusCreated) {
+		t.Fatalf("fresh status = %q, want %q", fresh.Status, channel.StatusCreated)
 	}
+}
+
+func TestLastMemberExpiryClosesPendingConnection(t *testing.T) {
+	fixture := newRelayFixture(t, 25*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+	bob := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialWSWithTokenQuery(t, bob.WSURL, bob.Token)
+	_ = readEventOfType(t, aliceWS, "join.request", nil)
+
+	if err := aliceWS.Close(websocket.StatusNormalClosure, "disconnect last owner"); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, func() bool { return fixture.registry.Channel(alice.ChannelID) == nil })
+	assertCloseStatus(t, bobWS, websocket.StatusPolicyViolation)
 }
 
 func TestHTTPConnectWithoutWebSocketDoesNotCreateOnlineOwner(t *testing.T) {

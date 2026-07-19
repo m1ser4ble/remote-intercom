@@ -378,6 +378,10 @@ func pendingJoinByDevice(ch *channel.Channel, deviceID string) (string, channel.
 }
 
 func (h *Hub) sendList(c *connection, replyTo string) {
+	if !c.isMember() {
+		c.sendError("unauthorized", "pending connections cannot list members", replyTo)
+		return
+	}
 	ch := h.registry.Channel(c.channelID)
 	if ch == nil {
 		c.sendError("invalid_event", "channel not found", replyTo)
