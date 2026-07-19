@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,6 +91,11 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 	if got := stringPayload(t, approved.Payload, "deviceId"); got != "dev_bob" {
 		t.Fatalf("join approval device id = %q, want dev_bob", got)
 	}
+	decisionAck := readUntil(t, aliceWS, "join.decision.ack", func(event protocol.Event) bool { return event.ReplyTo == "approve-bob" })
+	assertAck(t, decisionAck, "join.decision.ack", "approve-bob", "dev_bob")
+	_ = readUntil(t, aliceWS, "presence.changed", func(event protocol.Event) bool {
+		return stringPayload(t, event.Payload, "deviceId") == "dev_bob"
+	})
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "send-1",
@@ -102,6 +108,7 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 	})
 	message := readUntil(t, bobWS, "message.send", func(event protocol.Event) bool { return event.ID == "send-1" })
 	assertMessage(t, message, "message.send", alice.ChannelID, "dev_alice", "dev_bob", "send", "hello bob", "")
+	assertAck(t, readUntil(t, aliceWS, "message.ack", func(event protocol.Event) bool { return event.ReplyTo == "send-1" }), "message.ack", "send-1", "dev_bob")
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "ask-1",
@@ -114,6 +121,7 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 	})
 	ask := readUntil(t, bobWS, "message.ask", func(event protocol.Event) bool { return event.ID == "ask-1" })
 	assertMessage(t, ask, "message.ask", alice.ChannelID, "dev_alice", "dev_bob", "ask", "approve deploy?", "")
+	assertAck(t, readUntil(t, aliceWS, "message.ack", func(event protocol.Event) bool { return event.ReplyTo == "ask-1" }), "message.ack", "ask-1", "dev_bob")
 
 	writeEvent(t, bobWS, protocol.Event{
 		ID:      "reply-1",
@@ -127,6 +135,7 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 	})
 	reply := readUntil(t, aliceWS, "message.reply", func(event protocol.Event) bool { return event.ID == "reply-1" }, "presence.changed", "owner.changed")
 	assertMessage(t, reply, "message.reply", alice.ChannelID, "dev_bob", "dev_alice", "reply", "approved", "ask-1")
+	assertAck(t, readUntil(t, bobWS, "message.ack", func(event protocol.Event) bool { return event.ReplyTo == "reply-1" }), "message.ack", "reply-1", "dev_alice")
 
 	if err := aliceWS.Close(websocket.StatusNormalClosure, "e2e disconnect alice"); err != nil {
 		t.Fatalf("close alice websocket: %v", err)
@@ -148,6 +157,39 @@ func TestRemoteIntercomEndToEndSmoke(t *testing.T) {
 	}
 	reconnectedAliceWS := dialMemberWS(t, reconnectedAlice.WSURL, reconnectedAlice.Token)
 	waitForOwner(t, reconnectedAliceWS, alice.ChannelID, "dev_alice", "", "dev_alice")
+}
+
+func TestRemoteIntercomFiveMessageBurst(t *testing.T) {
+	fixture := newRelayFixture(t)
+	alice := fixture.connect(t, protocol.ConnectRequest{ChannelName: "burst", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialMemberWS(t, alice.WSURL, alice.Token)
+	bob := fixture.connect(t, protocol.ConnectRequest{ChannelName: "burst", PIN: "123456", DeviceName: "bob", DeviceID: "dev_bob"})
+	bobWS := dialMemberWS(t, bob.WSURL, bob.Token)
+	_ = readUntil(t, aliceWS, "join.request", func(event protocol.Event) bool { return event.From == "dev_bob" })
+
+	writeEvent(t, aliceWS, protocol.Event{
+		ID: "approve-burst", Type: "join.approve",
+		Payload: map[string]any{"joinRequestId": bob.JoinRequestID},
+	})
+	_ = readUntil(t, bobWS, "join.approved", func(event protocol.Event) bool { return event.ReplyTo == "approve-burst" })
+	decisionAck := readUntil(t, aliceWS, "join.decision.ack", func(event protocol.Event) bool { return event.ReplyTo == "approve-burst" })
+	assertAck(t, decisionAck, "join.decision.ack", "approve-burst", "dev_bob")
+	_ = readUntil(t, aliceWS, "presence.changed", func(event protocol.Event) bool {
+		return stringPayload(t, event.Payload, "deviceId") == "dev_bob"
+	})
+
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("chunk-%d", i)
+		text := fmt.Sprintf("CHUNK %d/5 ", i) + strings.Repeat(fmt.Sprintf("%d", i), 12_000)
+		writeEvent(t, aliceWS, protocol.Event{
+			ID: id, Type: "message.send", To: "dev_bob",
+			Payload: map[string]any{"kind": "send", "text": text},
+		})
+		received := readUntil(t, bobWS, "message.send", func(event protocol.Event) bool { return event.ID == id })
+		assertMessage(t, received, "message.send", alice.ChannelID, "dev_alice", "dev_bob", "send", text, "")
+		ack := readUntil(t, aliceWS, "message.ack", func(event protocol.Event) bool { return event.ReplyTo == id })
+		assertAck(t, ack, "message.ack", id, "dev_bob")
+	}
 }
 
 type relayFixture struct {
@@ -341,6 +383,16 @@ func assertMessage(t *testing.T, event protocol.Event, eventType, channelID, fro
 	}
 	if got := stringPayload(t, event.Payload, "text"); got != text {
 		t.Fatalf("payload text = %q, want %q", got, text)
+	}
+}
+
+func assertAck(t *testing.T, event protocol.Event, eventType, replyTo, deviceID string) {
+	t.Helper()
+	if event.Type != eventType || event.ReplyTo != replyTo {
+		t.Fatalf("ack = type %q replyTo %q, want %q/%q", event.Type, event.ReplyTo, eventType, replyTo)
+	}
+	if got := stringPayload(t, event.Payload, "deviceId"); got != deviceID {
+		t.Fatalf("ack device id = %q, want %q", got, deviceID)
 	}
 }
 

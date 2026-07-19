@@ -63,6 +63,13 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	if token, ok := approved.Payload["token"].(string); !ok || token == "" {
 		t.Fatalf("join.approved missing member token payload: %+v", approved.Payload)
 	}
+	decisionAck := readEventOfType(t, aliceWS, "join.decision.ack", func(event protocol.Event) bool {
+		return event.ReplyTo == "approve-1"
+	})
+	assertAck(t, decisionAck, "join.decision.ack", "approve-1", "dev_bob")
+	if got := stringPayload(t, decisionAck.Payload, "decision"); got != "approved" {
+		t.Fatalf("decision = %q, want approved", got)
+	}
 
 	writeEvent(t, bobWS, protocol.Event{
 		ID:   "send-joined",
@@ -80,6 +87,9 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	if got := stringPayload(t, fromJoinedMember.Payload, "text"); got != "hello alice" {
 		t.Fatalf("payload text = %q, want hello alice", got)
 	}
+	assertAck(t, readEventOfType(t, bobWS, "message.ack", func(event protocol.Event) bool {
+		return event.ReplyTo == "send-joined"
+	}), "message.ack", "send-joined", "dev_alice")
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "send-1",
@@ -100,6 +110,9 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	if got := stringPayload(t, direct.Payload, "text"); got != "hello bob" {
 		t.Fatalf("payload text = %q, want hello bob", got)
 	}
+	assertAck(t, readEventOfType(t, aliceWS, "message.ack", func(event protocol.Event) bool {
+		return event.ReplyTo == "send-1"
+	}), "message.ack", "send-1", "dev_bob")
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "send-by-name",
@@ -120,6 +133,9 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	if got := stringPayload(t, byName.Payload, "text"); got != "hello by name" {
 		t.Fatalf("payload text = %q, want hello by name", got)
 	}
+	assertAck(t, readEventOfType(t, aliceWS, "message.ack", func(event protocol.Event) bool {
+		return event.ReplyTo == "send-by-name"
+	}), "message.ack", "send-by-name", "dev_bob")
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "ask-1",
@@ -133,6 +149,9 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	if ask.Type != "message.ask" || ask.From != "dev_alice" || ask.To != "dev_bob" {
 		t.Fatalf("ask route = type %s %s -> %s, want message.ask dev_alice -> dev_bob", ask.Type, ask.From, ask.To)
 	}
+	assertAck(t, readEventOfType(t, aliceWS, "message.ack", func(event protocol.Event) bool {
+		return event.ReplyTo == "ask-1"
+	}), "message.ack", "ask-1", "dev_bob")
 
 	writeEvent(t, bobWS, protocol.Event{
 		ID:      "reply-1",
@@ -147,6 +166,9 @@ func TestWebSocketJoinApprovalAndMessageRouting(t *testing.T) {
 	if reply.From != "dev_bob" || reply.To != "dev_alice" || reply.ReplyTo != "ask-1" {
 		t.Fatalf("reply route = %s -> %s replyTo %s, want dev_bob -> dev_alice replyTo ask-1", reply.From, reply.To, reply.ReplyTo)
 	}
+	assertAck(t, readEventOfType(t, bobWS, "message.ack", func(event protocol.Event) bool {
+		return event.ReplyTo == "reply-1"
+	}), "message.ack", "reply-1", "dev_alice")
 
 	writeEvent(t, aliceWS, protocol.Event{
 		ID:   "broadcast-1",
@@ -186,6 +208,21 @@ func TestPendingConnectionCannotRouteMessages(t *testing.T) {
 	if got := stringPayload(t, errorEvent.Payload, "code"); got != "unauthorized" {
 		t.Fatalf("error code = %q, want unauthorized", got)
 	}
+}
+
+func TestUnknownTargetReturnsCorrelatedErrorWithoutAck(t *testing.T) {
+	fixture := newRelayFixture(t, 50*time.Millisecond)
+	alice := postConnect(t, fixture.server, protocol.ConnectRequest{ChannelName: "ops", PIN: "123456", DeviceName: "alice", DeviceID: "dev_alice"})
+	aliceWS := dialWSWithTokenQuery(t, alice.WSURL, alice.Token)
+
+	writeEvent(t, aliceWS, protocol.Event{ID: "send-missing", Type: "message.send", To: "dev_missing"})
+	failed := readEventOfType(t, aliceWS, "error", func(event protocol.Event) bool {
+		return event.ReplyTo == "send-missing"
+	})
+	if got := stringPayload(t, failed.Payload, "code"); got != "unknown_target" {
+		t.Fatalf("error code = %q, want unknown_target", got)
+	}
+	assertNoEvent(t, aliceWS, 200*time.Millisecond)
 }
 
 func TestPendingConnectionCanRequestStatusButCannotListMembers(t *testing.T) {
@@ -249,6 +286,13 @@ func TestDeniedPendingConnectionReceivesDeniedThenCloses(t *testing.T) {
 	}
 	if denied.ReplyTo != "deny-1" {
 		t.Fatalf("replyTo = %q, want deny-1", denied.ReplyTo)
+	}
+	decisionAck := readEventOfType(t, aliceWS, "join.decision.ack", func(event protocol.Event) bool {
+		return event.ReplyTo == "deny-1"
+	})
+	assertAck(t, decisionAck, "join.decision.ack", "deny-1", "dev_bob")
+	if got := stringPayload(t, decisionAck.Payload, "decision"); got != "denied" {
+		t.Fatalf("decision = %q, want denied", got)
 	}
 
 	assertCloseStatus(t, bobWS, websocket.StatusPolicyViolation)
@@ -604,6 +648,16 @@ func waitForCondition(t *testing.T, condition func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition was not met before deadline")
+}
+
+func assertAck(t *testing.T, event protocol.Event, eventType, replyTo, deviceID string) {
+	t.Helper()
+	if event.Type != eventType || event.ReplyTo != replyTo {
+		t.Fatalf("ack = type %q replyTo %q, want %q/%q", event.Type, event.ReplyTo, eventType, replyTo)
+	}
+	if got := stringPayload(t, event.Payload, "deviceId"); got != deviceID {
+		t.Fatalf("ack device id = %q, want %q", got, deviceID)
+	}
 }
 
 func stringPayload(t *testing.T, payload map[string]any, key string) string {

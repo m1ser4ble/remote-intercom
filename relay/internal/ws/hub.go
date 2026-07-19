@@ -238,8 +238,19 @@ func (h *Hub) handleMessageSend(c *connection, event protocol.Event) {
 		event.Payload = map[string]any{}
 	}
 	if err := target.writeEvent(event); err != nil {
-		c.sendError("unknown_target", "target is not reachable", event.ID)
+		c.sendError("target_unreachable", "target is not reachable", event.ID)
+		return
 	}
+	_ = c.writeEvent(protocol.Event{
+		Type:      "message.ack",
+		ChannelID: c.channelID,
+		To:        c.deviceID,
+		ReplyTo:   event.ID,
+		Payload: map[string]any{
+			"status":   "delivered",
+			"deviceId": target.deviceID,
+		},
+	})
 }
 
 func (h *Hub) handleMessageBroadcast(c *connection, event protocol.Event) {
@@ -302,6 +313,22 @@ func (h *Hub) handleJoinDecision(c *connection, event protocol.Event, approve bo
 		c.sendError("invalid_event", err.Error(), event.ID)
 		return
 	}
+
+	decision := "denied"
+	if approve {
+		decision = "approved"
+	}
+	_ = c.writeEvent(protocol.Event{
+		Type:      "join.decision.ack",
+		ChannelID: c.channelID,
+		To:        c.deviceID,
+		ReplyTo:   event.ID,
+		Payload: map[string]any{
+			"joinRequestId": joinRequestID,
+			"deviceId":      join.DeviceID,
+			"decision":      decision,
+		},
+	})
 
 	pendingConn := h.pendingConnection(joinRequestID)
 	if pendingConn == nil {
