@@ -98,7 +98,7 @@ Connect to `wsUrl` with either:
 - `Authorization: Bearer <token>`
 - `?token=<token>` query parameter
 
-All frames are UTF-8 JSON text. Frames larger than 64 KiB are rejected.
+All frames are UTF-8 JSON text. The complete serialized frame, including the event envelope, must not exceed 65,536 bytes. Clients reject oversized outbound events before socket write; the relay read limit remains defense in depth.
 
 ```json
 {
@@ -113,6 +113,19 @@ All frames are UTF-8 JSON text. Frames larger than 64 KiB are rejected.
 ```
 
 Clients may omit `channelId` and `from`; the relay fills or validates them from the token.
+
+### Role permissions
+
+| Event | Member | Pending |
+|---|---:|---:|
+| `status.request` | yes | yes |
+| `list.request` | yes | no |
+| `message.send` / `message.ask` / `message.reply` | yes | no |
+| `message.broadcast` | yes | no |
+| `join.approve` / `join.deny` | current owner only | no |
+| Receive `join.approved` / `join.denied` | n/a | yes |
+
+Disallowed requests receive a correlated `error` with code `unauthorized`.
 
 ## Event types
 
@@ -167,6 +180,25 @@ Broadcast to other online members in the channel.
   "payload": {"text":"standup starting"}
 }
 ```
+
+### `message.ack`
+
+For `message.send`, `message.ask`, and `message.reply`, the relay acknowledges the sender only after writing the original event to the target WebSocket:
+
+```json
+{
+  "type": "message.ack",
+  "channelId": "ch_...",
+  "to": "dev_alice",
+  "replyTo": "evt_101",
+  "payload": {
+    "status": "delivered",
+    "deviceId": "dev_bob"
+  }
+}
+```
+
+This confirms target socket write, not agent processing or user read. A client that times out waiting for this ACK reports an unknown delivery outcome and does not automatically replay the message.
 
 ### `join.request`
 
@@ -230,6 +262,24 @@ The pending device receives one of:
 }
 ```
 
+After applying the decision, the relay confirms it to the owner:
+
+```json
+{
+  "type": "join.decision.ack",
+  "channelId": "ch_...",
+  "to": "dev_alice",
+  "replyTo": "evt_301",
+  "payload": {
+    "joinRequestId": "join_...",
+    "deviceId": "dev_bob",
+    "decision": "approved"
+  }
+}
+```
+
+`decision` is `approved` or `denied`. Owner tools report success and remove local pending state only after this ACK.
+
 ### `list.request` / `list.response`
 
 ```json
@@ -272,6 +322,18 @@ The pending device receives one of:
   }
 }
 ```
+
+## Liveness and recovery
+
+The relay sends protocol-level WebSocket ping frames for server-side liveness. Clients additionally send an application `status.request` every 25 seconds and require a matching `status.response` within 5 seconds.
+
+A heartbeat timeout means the transport is half-open or non-responsive even when its local `readyState` is still open. The client marks it stale, emits a diagnostic, closes the stale socket, and starts bounded reconnect. This applies to members and pending devices. Explicit disconnect disables heartbeat and reconnect.
+
+Before a network tool action, a stale client probes or restores the connection. A message written before its ACK times out is never automatically replayed.
+
+## Channel expiry
+
+Member disconnect starts the 30-second reconnect grace. A reconnect during grace preserves membership and priority. When the last online member exceeds grace, the relay deletes the channel, membership history, and pending joins. A later connection using the same name and PIN creates a new channel.
 
 ### `error`
 

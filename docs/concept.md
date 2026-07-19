@@ -26,7 +26,8 @@ dwkim 1234
 - Owner is not a fixed account. It is the highest-priority online member.
 - If the owner disconnects, ownership fails over to the next online member.
 - If the original owner reconnects while the channel still exists, it becomes owner again.
-- If all members leave and reconnect grace expires, the channel is deleted.
+- If all members leave and reconnect grace expires, the channel and its membership history are deleted.
+- Pending devices can check their own status and receive a join decision, but cannot list members, exchange messages, or decide joins.
 
 This makes channels **live rooms**, not permanent server-side accounts.
 
@@ -48,8 +49,10 @@ The design favors:
 The relay needs to know who is live now. Presence and owner election depend on active connections, not just stored tokens. WebSocket gives the relay a clear live-session primitive:
 
 ```text
-socket open + heartbeat = online
+socket open + relay activity = connected
+application heartbeat timeout = stale and reconnecting
 socket gone past grace = offline
+last member offline past grace = channel deleted
 ```
 
 HTTP is still used where it fits better:
@@ -58,6 +61,18 @@ HTTP is still used where it fits better:
 - health/version checks;
 - channel connect/bootstrap;
 - signed token issuance.
+
+## Live delivery contract
+
+Remote Intercom confirms live socket delivery without pretending to be a durable queue:
+
+- `send`, `ask`, and `reply` succeed only after the relay writes the event to the target WebSocket and returns a correlated acknowledgement.
+- An acknowledgement means target socket write succeeded. It does not mean the target agent or user processed or read the message.
+- If an acknowledgement times out, the outcome is unknown and the client does not automatically replay the message.
+- The complete serialized UTF-8 WebSocket frame must be at most 64 KiB. Oversized events are rejected before socket write.
+- Members and pending devices use application-level status heartbeats so a locally open but non-responsive connection is detected and reconnected.
+
+Durable queues, automatic chunking, processing receipts, and cross-process connection persistence remain outside the MVP.
 
 ## Security posture
 

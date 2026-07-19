@@ -68,7 +68,10 @@ npm run build
 
 ## Documentation
 
+- [Agent contract](AGENTS.md)
 - [Concept and design direction](docs/concept.md)
+- [Architecture decisions](docs/decisions/)
+- [Change specifications](docs/specs/)
 - [Wire protocol](protocol/wire.md)
 - [Self-hosting](docs/self-hosting.md)
 - [Security model](docs/security.md)
