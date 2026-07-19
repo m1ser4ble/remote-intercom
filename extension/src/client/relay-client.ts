@@ -3,8 +3,10 @@ import DefaultWebSocket from "ws";
 import {
   type ConnectRequest,
   type ConnectResponse,
+  type JoinDecisionAckPayload,
   type JoinDecisionPayload,
   type ListResponsePayload,
+  type MessageAckPayload,
   type MessagePayload,
   type RelayEvent,
   RelayEventType,
@@ -81,12 +83,14 @@ export interface RelayClientState {
 export class RelayClientError extends Error {
   readonly status?: number;
   readonly details?: unknown;
+  readonly code?: string;
 
-  constructor(message: string, status?: number, details?: unknown) {
+  constructor(message: string, status?: number, details?: unknown, code?: string) {
     super(message);
     this.name = "RelayClientError";
     this.status = status;
     this.details = details;
+    this.code = code;
   }
 }
 
@@ -97,7 +101,7 @@ export class RelayClient {
   private readonly idGenerator: IdGenerator;
   private readonly reconnectDelayMs: number;
   private readonly handlers = new Map<string, Set<RelayEventHandler>>();
-  private readonly responseWaiters = new Map<string, { responseType: string; resolve: (event: RelayEvent) => void; reject: (error: RelayClientError) => void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly responseWaiters = new Map<string, { responseType: string; timeoutCode?: string; resolve: (event: RelayEvent) => void; reject: (error: RelayClientError) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly replyTargets = new Map<string, string>();
   private readonly suppressReconnectForSocket = new WeakSet<WebSocketLike>();
   private socket?: WebSocketLike;
@@ -221,59 +225,70 @@ export class RelayClient {
       id: event.id ?? this.idGenerator(),
       channelId: event.channelId ?? this.state.channelId,
     };
-    socket.send(JSON.stringify(outbound));
+    const serialized = JSON.stringify(outbound);
+    const actualBytes = Buffer.byteLength(serialized, "utf8");
+    const limitBytes = 64 * 1024;
+    if (actualBytes > limitBytes) {
+      throw new RelayClientError(
+        `relay event exceeds maximum size of ${limitBytes} bytes`,
+        undefined,
+        { limitBytes, actualBytes },
+        "message_too_large",
+      );
+    }
+    socket.send(serialized);
     return outbound;
   }
 
-  send(to: string, message: string): RelayEvent<MessagePayload> {
-    return this.sendEvent({
+  send(to: string, message: string, timeoutMs = 10_000): Promise<RelayRequestResponse<MessageAckPayload>> {
+    return this.requestResponse<MessageAckPayload>({
       type: RelayEventType.MessageSend,
       to,
       payload: { text: message, kind: "send" },
-    }) as RelayEvent<MessagePayload>;
+    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown");
   }
 
-  ask(to: string, message: string): RelayEvent<MessagePayload> {
-    return this.sendEvent({
+  ask(to: string, message: string, timeoutMs = 10_000): Promise<RelayRequestResponse<MessageAckPayload>> {
+    return this.requestResponse<MessageAckPayload>({
       type: RelayEventType.MessageAsk,
       to,
       payload: { text: message, kind: "ask" },
-    }) as RelayEvent<MessagePayload>;
+    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown");
   }
 
-  reply(replyTo: string, message: string): RelayEvent<MessagePayload> {
+  reply(replyTo: string, message: string, timeoutMs = 10_000): Promise<RelayRequestResponse<MessageAckPayload>> {
     const to = this.replyTargets.get(replyTo);
     if (to === undefined) {
-      throw new RelayClientError(`no reply target recorded for ${replyTo}`);
+      return Promise.reject(new RelayClientError(`no reply target recorded for ${replyTo}`));
     }
-    return this.sendEvent({
+    return this.requestResponse<MessageAckPayload>({
       type: RelayEventType.MessageReply,
       to,
       replyTo,
       payload: { text: message, kind: "reply" },
-    }) as RelayEvent<MessagePayload>;
+    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown");
   }
 
-  approve(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
-    return this.sendEvent({
+  approve(joinRequestId: string, timeoutMs = 10_000): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
+    return this.requestResponse<JoinDecisionAckPayload>({
       type: RelayEventType.JoinApprove,
       payload: { joinRequestId },
-    }) as RelayEvent<JoinDecisionPayload>;
+    }, RelayEventType.JoinDecisionAck, timeoutMs, "decision_unknown");
   }
 
-  deny(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
-    return this.sendEvent({
+  deny(joinRequestId: string, timeoutMs = 10_000): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
+    return this.requestResponse<JoinDecisionAckPayload>({
       type: RelayEventType.JoinDeny,
       payload: { joinRequestId },
-    }) as RelayEvent<JoinDecisionPayload>;
+    }, RelayEventType.JoinDecisionAck, timeoutMs, "decision_unknown");
   }
 
-  approveJoin(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
-    return this.approve(joinRequestId);
+  approveJoin(joinRequestId: string, timeoutMs = 10_000): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
+    return this.approve(joinRequestId, timeoutMs);
   }
 
-  denyJoin(joinRequestId: string): RelayEvent<JoinDecisionPayload> {
-    return this.deny(joinRequestId);
+  denyJoin(joinRequestId: string, timeoutMs = 10_000): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
+    return this.deny(joinRequestId, timeoutMs);
   }
 
   async list(timeoutMs = 5_000): Promise<RelayRequestResponse<ListResponsePayload>> {
@@ -284,7 +299,12 @@ export class RelayClient {
     return this.requestResponse<StatusResponsePayload>({ type: RelayEventType.StatusRequest }, RelayEventType.StatusResponse, timeoutMs);
   }
 
-  requestResponse<TPayload extends Record<string, unknown>>(event: RelayEvent, responseType: string, timeoutMs = 5_000): Promise<RelayRequestResponse<TPayload>> {
+  requestResponse<TPayload extends Record<string, unknown>>(
+    event: RelayEvent,
+    responseType: string,
+    timeoutMs = 5_000,
+    timeoutCode?: string,
+  ): Promise<RelayRequestResponse<TPayload>> {
     const requestEvent = this.sendEvent(event);
     const requestId = requestEvent.id;
     if (requestId === undefined) {
@@ -294,10 +314,16 @@ export class RelayClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.responseWaiters.delete(requestId);
-        reject(new RelayClientError(`timed out waiting for ${responseType}`));
+        reject(new RelayClientError(
+          `timed out waiting for ${responseType}`,
+          undefined,
+          { requestId, responseType },
+          timeoutCode,
+        ));
       }, timeoutMs);
       this.responseWaiters.set(requestId, {
         responseType,
+        timeoutCode,
         resolve: (responseEvent) => {
           const payload = responseEvent.payload;
           if (!isRecord(payload)) {
@@ -519,7 +545,18 @@ export class RelayClient {
       return;
     }
     const waiter = this.responseWaiters.get(replyTo);
-    if (waiter === undefined || waiter.responseType !== event.type) {
+    if (waiter === undefined) {
+      return;
+    }
+    if (event.type === RelayEventType.Error) {
+      this.responseWaiters.delete(replyTo);
+      clearTimeout(waiter.timer);
+      const code = typeof event.payload?.code === "string" ? event.payload.code : "relay_error";
+      const message = typeof event.payload?.message === "string" ? event.payload.message : code;
+      waiter.reject(new RelayClientError(message, undefined, event, code));
+      return;
+    }
+    if (waiter.responseType !== event.type) {
       return;
     }
     this.responseWaiters.delete(replyTo);

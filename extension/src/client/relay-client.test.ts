@@ -378,6 +378,117 @@ describe("RelayClient", () => {
     }));
   });
 
+  it("rejects an oversized serialized UTF-8 frame before socket write", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => "msg_1" },
+    );
+    await connectAndOpen(client);
+    const socket = MockWebSocket.instances[0];
+    const writesBefore = socket?.sent.length ?? 0;
+
+    await expect(Promise.resolve().then(() => client.send("dev_2", "한".repeat(30_000)))).rejects.toMatchObject({
+      code: "message_too_large",
+      details: expect.objectContaining({ limitBytes: 65_536 }),
+    });
+    expect(socket?.sent).toHaveLength(writesBefore);
+  });
+
+  it("allows a complete serialized frame at exactly 65536 bytes", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => "msg_1" },
+    );
+    await connectAndOpen(client);
+    const socket = MockWebSocket.instances[0];
+    const emptyEvent = {
+      type: RelayEventType.MessageSend,
+      to: "dev_2",
+      payload: { text: "", kind: "send" },
+      id: "msg_1",
+      channelId: "ch_1",
+    };
+    const overhead = Buffer.byteLength(JSON.stringify(emptyEvent), "utf8");
+    const result = client.send("dev_2", "a".repeat(65_536 - overhead));
+    expect(result).toBeInstanceOf(Promise);
+    if (!(result instanceof Promise)) return;
+
+    expect(Buffer.byteLength(socket?.sent.at(-1) ?? "", "utf8")).toBe(65_536);
+    socket?.emitMessage({
+      type: "message.ack",
+      replyTo: "msg_1",
+      payload: { status: "delivered", deviceId: "dev_2" },
+    });
+    await expect(result).resolves.toEqual(expect.objectContaining({ payload: { status: "delivered", deviceId: "dev_2" } }));
+  });
+
+  it("resolves send only after its correlated message ack", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => "msg_1" },
+    );
+    await connectAndOpen(client);
+    const result = client.send("dev_2", "hello");
+    expect(result).toBeInstanceOf(Promise);
+    if (!(result instanceof Promise)) return;
+
+    const settled = vi.fn();
+    void result.then(settled);
+    await flushPromises();
+    expect(settled).not.toHaveBeenCalled();
+    MockWebSocket.instances[0]?.emitMessage({
+      type: "message.ack",
+      replyTo: "msg_1",
+      payload: { status: "delivered", deviceId: "dev_2" },
+    });
+    await expect(result).resolves.toEqual(expect.objectContaining({
+      requestEvent: expect.objectContaining({ type: RelayEventType.MessageSend }),
+      responseEvent: expect.objectContaining({ type: "message.ack", replyTo: "msg_1" }),
+      payload: { status: "delivered", deviceId: "dev_2" },
+    }));
+  });
+
+  it("rejects send on a correlated relay error", async () => {
+    const client = new RelayClient(
+      { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+      { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => "msg_1" },
+    );
+    await connectAndOpen(client);
+    const result = client.send("missing", "hello");
+    expect(result).toBeInstanceOf(Promise);
+    if (!(result instanceof Promise)) return;
+
+    MockWebSocket.instances[0]?.emitMessage({
+      type: RelayEventType.Error,
+      replyTo: "msg_1",
+      payload: { code: "unknown_target", message: "target is not online" },
+    });
+    await expect(result).rejects.toMatchObject({ code: "unknown_target" });
+  });
+
+  it("reports delivery unknown without replaying after ack timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new RelayClient(
+        { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+        { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => "msg_1" },
+      );
+      await connectAndOpen(client);
+      const socket = MockWebSocket.instances[0];
+      const result = client.send("dev_2", "hello", 5);
+      expect(result).toBeInstanceOf(Promise);
+      if (!(result instanceof Promise)) return;
+
+      expect(socket?.sent).toHaveLength(1);
+      const rejection = expect(result).rejects.toMatchObject({ code: "delivery_unknown" });
+      await vi.advanceTimersByTimeAsync(5);
+      await rejection;
+      expect(socket?.sent).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("serializes send, ask, reply, join decisions, list, and status events", async () => {
     let counter = 0;
     const client = new RelayClient(
@@ -392,14 +503,14 @@ describe("RelayClient", () => {
     const socket = MockWebSocket.instances[0];
     expect(socket).toBeDefined();
 
-    client.send("dev_2", "hello");
-    client.ask("dev_2", "question?");
+    const sendPromise = client.send("dev_2", "hello");
+    const askPromise = client.ask("dev_2", "question?");
     socket?.emitMessage({ id: "ask_in", type: RelayEventType.MessageAsk, from: "dev_2", to: "dev_1", payload: { text: "remote question?", kind: "ask" } });
-    client.reply("ask_in", "answer");
-    client.approve("join_1");
-    client.deny("join_2");
-    client.list();
-    client.status();
+    const replyPromise = client.reply("ask_in", "answer");
+    const approvePromise = client.approve("join_1");
+    const denyPromise = client.deny("join_2");
+    const listPromise = client.list();
+    const statusPromise = client.status();
 
     const events = socket?.sent.map((raw) => JSON.parse(raw) as RelayEvent) ?? [];
     expect(events).toEqual([
@@ -411,6 +522,15 @@ describe("RelayClient", () => {
       expect.objectContaining({ id: "evt_6", type: RelayEventType.ListRequest, channelId: "ch_1" }),
       expect.objectContaining({ id: "evt_7", type: RelayEventType.StatusRequest, channelId: "ch_1" }),
     ]);
+
+    socket?.emitMessage({ type: RelayEventType.MessageAck, replyTo: "evt_1", payload: { status: "delivered", deviceId: "dev_2" } });
+    socket?.emitMessage({ type: RelayEventType.MessageAck, replyTo: "evt_2", payload: { status: "delivered", deviceId: "dev_2" } });
+    socket?.emitMessage({ type: RelayEventType.MessageAck, replyTo: "evt_3", payload: { status: "delivered", deviceId: "dev_2" } });
+    socket?.emitMessage({ type: RelayEventType.JoinDecisionAck, replyTo: "evt_4", payload: { joinRequestId: "join_1", deviceId: "dev_2", decision: "approved" } });
+    socket?.emitMessage({ type: RelayEventType.JoinDecisionAck, replyTo: "evt_5", payload: { joinRequestId: "join_2", deviceId: "dev_3", decision: "denied" } });
+    socket?.emitMessage({ type: RelayEventType.ListResponse, replyTo: "evt_6", payload: { ownerId: "dev_1", members: [] } });
+    socket?.emitMessage({ type: RelayEventType.StatusResponse, replyTo: "evt_7", payload: { status: "member", channelId: "ch_1", deviceId: "dev_1", ownerId: "dev_1" } });
+    await Promise.all([sendPromise, askPromise, replyPromise, approvePromise, denyPromise, listPromise, statusPromise]);
   });
 
   it("serializes approveJoin and denyJoin aliases", async () => {
@@ -426,14 +546,17 @@ describe("RelayClient", () => {
     await connectAndOpen(client);
     const socket = MockWebSocket.instances[0];
 
-    client.approveJoin("join_alias_1");
-    client.denyJoin("join_alias_2");
+    const approvePromise = client.approveJoin("join_alias_1");
+    const denyPromise = client.denyJoin("join_alias_2");
 
     const events = socket?.sent.map((raw) => JSON.parse(raw) as RelayEvent) ?? [];
     expect(events).toEqual([
       expect.objectContaining({ id: "evt_1", type: RelayEventType.JoinApprove, channelId: "ch_1", payload: { joinRequestId: "join_alias_1" } }),
       expect.objectContaining({ id: "evt_2", type: RelayEventType.JoinDeny, channelId: "ch_1", payload: { joinRequestId: "join_alias_2" } }),
     ]);
+    socket?.emitMessage({ type: RelayEventType.JoinDecisionAck, replyTo: "evt_1", payload: { joinRequestId: "join_alias_1", deviceId: "dev_2", decision: "approved" } });
+    socket?.emitMessage({ type: RelayEventType.JoinDecisionAck, replyTo: "evt_2", payload: { joinRequestId: "join_alias_2", deviceId: "dev_3", decision: "denied" } });
+    await Promise.all([approvePromise, denyPromise]);
   });
 
   it("emits diagnostic events when an established member socket closes and schedules reconnect", async () => {

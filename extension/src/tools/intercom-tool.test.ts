@@ -1,6 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { RelayEventType, type ConnectResponse, type ListResponsePayload, type MessagePayload, type RelayEvent, type StatusResponsePayload } from "../client/protocol.js";
+import {
+  RelayEventType,
+  type ConnectResponse,
+  type JoinDecisionAckPayload,
+  type ListResponsePayload,
+  type MessageAckPayload,
+  type RelayEvent,
+  type StatusResponsePayload,
+} from "../client/protocol.js";
+import type { RelayRequestResponse } from "../client/relay-client.js";
 import { PendingState } from "../state/pending.js";
 import { createRemoteIntercomTool, type RemoteIntercomClient } from "./intercom-tool.js";
 
@@ -52,16 +61,19 @@ class MockClient implements RemoteIntercomClient {
     };
   }
 
-  send(to: string, message: string): RelayEvent<MessagePayload> {
-    return this.record({ id: "evt_send", type: RelayEventType.MessageSend, to, payload: { text: message, kind: "send" } });
+  send(to: string, message: string): Promise<RelayRequestResponse<MessageAckPayload>> {
+    const request = this.record({ id: "evt_send", type: RelayEventType.MessageSend, to, payload: { text: message, kind: "send" } });
+    return this.acknowledge(request, RelayEventType.MessageAck, { status: "delivered", deviceId: to });
   }
 
-  ask(to: string, message: string): RelayEvent<MessagePayload> {
-    return this.record({ id: "evt_ask", type: RelayEventType.MessageAsk, to, payload: { text: message, kind: "ask" } });
+  ask(to: string, message: string): Promise<RelayRequestResponse<MessageAckPayload>> {
+    const request = this.record({ id: "evt_ask", type: RelayEventType.MessageAsk, to, payload: { text: message, kind: "ask" } });
+    return this.acknowledge(request, RelayEventType.MessageAck, { status: "delivered", deviceId: to });
   }
 
-  reply(replyTo: string, message: string): RelayEvent<MessagePayload> {
-    return this.record({ id: "evt_reply", type: RelayEventType.MessageReply, replyTo, payload: { text: message, kind: "reply" } });
+  reply(replyTo: string, message: string): Promise<RelayRequestResponse<MessageAckPayload>> {
+    const request = this.record({ id: "evt_reply", type: RelayEventType.MessageReply, replyTo, payload: { text: message, kind: "reply" } });
+    return this.acknowledge(request, RelayEventType.MessageAck, { status: "delivered", deviceId: "dev_2" });
   }
 
   async status(): Promise<{ requestEvent: RelayEvent; responseEvent: RelayEvent<StatusResponsePayload>; payload: StatusResponsePayload }> {
@@ -80,12 +92,22 @@ class MockClient implements RemoteIntercomClient {
     this.connectState = { ...this.connectState, status: "disconnected" };
   }
 
-  approveJoin(joinRequestId: string): RelayEvent {
-    return this.record({ id: "evt_approve", type: RelayEventType.JoinApprove, payload: { joinRequestId } });
+  approveJoin(joinRequestId: string): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
+    const request = this.record({ id: "evt_approve", type: RelayEventType.JoinApprove, payload: { joinRequestId } });
+    return this.acknowledge(request, RelayEventType.JoinDecisionAck, {
+      joinRequestId,
+      deviceId: "dev_2",
+      decision: "approved",
+    });
   }
 
-  denyJoin(joinRequestId: string): RelayEvent {
-    return this.record({ id: "evt_deny", type: RelayEventType.JoinDeny, payload: { joinRequestId } });
+  denyJoin(joinRequestId: string): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
+    const request = this.record({ id: "evt_deny", type: RelayEventType.JoinDeny, payload: { joinRequestId } });
+    return this.acknowledge(request, RelayEventType.JoinDecisionAck, {
+      joinRequestId,
+      deviceId: "dev_2",
+      decision: "denied",
+    });
   }
 
   on(eventType: string, handler: (event: RelayEvent) => void): () => void {
@@ -101,11 +123,33 @@ class MockClient implements RemoteIntercomClient {
     }
   }
 
+  private acknowledge<TPayload extends Record<string, unknown>>(
+    requestEvent: RelayEvent,
+    responseType: string,
+    payload: TPayload,
+  ): Promise<RelayRequestResponse<TPayload>> {
+    return Promise.resolve({
+      requestEvent,
+      responseEvent: { type: responseType, replyTo: requestEvent.id, payload },
+      payload,
+    });
+  }
+
   private record<TPayload extends Record<string, unknown> = Record<string, unknown>>(event: RelayEvent<TPayload>): RelayEvent<TPayload> {
     const outbound = { channelId: this.channelId, ...event };
     this.sent.push(outbound);
     return outbound;
   }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("remote intercom tool", () => {
@@ -145,6 +189,18 @@ describe("remote intercom tool", () => {
 
     await tool.execute({ action: "disconnect" });
     expect(client.currentStatus).toBe("disconnected");
+  });
+
+  it("returns relay delivery evidence for send", async () => {
+    const client = new MockClient();
+    const tool = createRemoteIntercomTool({ client });
+
+    await expect(tool.execute({ action: "send", to: "dev_2", message: "hello" })).resolves.toEqual(expect.objectContaining({
+      action: "send",
+      requestEvent: expect.objectContaining({ type: RelayEventType.MessageSend }),
+      responseEvent: expect.objectContaining({ type: RelayEventType.MessageAck }),
+      payload: { status: "delivered", deviceId: "dev_2" },
+    }));
   });
 
   it("rejects malformed tool inputs before dispatching to the client", async () => {
@@ -225,6 +281,52 @@ describe("remote intercom tool", () => {
     });
     await tool.execute({ action: "deny_join", id: "join_2" });
     expect(client.sent).toContainEqual(expect.objectContaining({ type: RelayEventType.JoinDeny, payload: { joinRequestId: "join_2" } }));
+  });
+
+  it("keeps a join pending until the relay acknowledges approval", async () => {
+    const client = new MockClient();
+    const pending = new PendingState();
+    pending.addJoinRequest({
+      id: "join_1", joinRequestId: "join_1", deviceId: "dev_2", deviceName: "Laptop",
+      channelId: "ch_1", receivedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const decision = deferred<Awaited<ReturnType<MockClient["approveJoin"]>>>();
+    vi.spyOn(client, "approveJoin").mockReturnValue(decision.promise);
+    const tool = createRemoteIntercomTool({ client, pending });
+
+    const execution = tool.execute({ action: "approve_join", joinRequestId: "join_1" });
+    expect(pending.getJoinRequest("join_1")).toBeDefined();
+    decision.resolve({
+      requestEvent: { id: "evt_approve", type: RelayEventType.JoinApprove },
+      responseEvent: {
+        type: RelayEventType.JoinDecisionAck, replyTo: "evt_approve",
+        payload: { joinRequestId: "join_1", deviceId: "dev_2", decision: "approved" },
+      },
+      payload: { joinRequestId: "join_1", deviceId: "dev_2", decision: "approved" },
+    });
+
+    await expect(execution).resolves.toEqual(expect.objectContaining({
+      action: "approve_join",
+      responseEvent: expect.objectContaining({ type: RelayEventType.JoinDecisionAck }),
+    }));
+    expect(pending.getJoinRequest("join_1")).toBeUndefined();
+  });
+
+  it.each(["unauthorized", "decision_unknown"])("keeps a join pending when approval fails with %s", async (code) => {
+    const client = new MockClient();
+    const pending = new PendingState();
+    pending.addJoinRequest({
+      id: "join_1", joinRequestId: "join_1", deviceId: "dev_2", deviceName: "Laptop",
+      channelId: "ch_1", receivedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const error = Object.assign(new Error(code), { code });
+    const rejected = Promise.reject(error) as ReturnType<MockClient["approveJoin"]>;
+    void rejected.catch(() => undefined);
+    vi.spyOn(client, "approveJoin").mockReturnValue(rejected);
+    const tool = createRemoteIntercomTool({ client, pending });
+
+    await expect(tool.execute({ action: "approve_join", joinRequestId: "join_1" })).rejects.toMatchObject({ code });
+    expect(pending.getJoinRequest("join_1")).toBeDefined();
   });
 
   it("ignores malformed join request relay events", async () => {

@@ -23,11 +23,13 @@ export const RelayEventType = {
   MessageAsk: "message.ask",
   MessageReply: "message.reply",
   MessageBroadcast: "message.broadcast",
+  MessageAck: "message.ack",
   JoinRequest: "join.request",
   JoinApprove: "join.approve",
   JoinDeny: "join.deny",
   JoinApproved: "join.approved",
   JoinDenied: "join.denied",
+  JoinDecisionAck: "join.decision.ack",
   ListRequest: "list.request",
   ListResponse: "list.response",
   StatusRequest: "status.request",
@@ -51,6 +53,11 @@ export interface MessagePayload extends Record<string, unknown> {
   kind?: "send" | "ask" | "reply";
 }
 
+export interface MessageAckPayload extends Record<string, unknown> {
+  status: "delivered";
+  deviceId: string;
+}
+
 export interface JoinRequestPayload extends Record<string, unknown> {
   joinRequestId: string;
   deviceId: string;
@@ -59,6 +66,12 @@ export interface JoinRequestPayload extends Record<string, unknown> {
 
 export interface JoinDecisionPayload extends Record<string, unknown> {
   joinRequestId: string;
+}
+
+export interface JoinDecisionAckPayload extends Record<string, unknown> {
+  joinRequestId: string;
+  deviceId: string;
+  decision: "approved" | "denied";
 }
 
 export interface ListMember extends Record<string, unknown> {

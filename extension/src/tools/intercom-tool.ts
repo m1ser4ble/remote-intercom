@@ -1,7 +1,9 @@
 import {
   type ConnectResponse,
+  type JoinDecisionAckPayload,
   type ListMember,
   type ListResponsePayload,
+  type MessageAckPayload,
   type MessagePayload,
   type RelayEvent,
   RelayEventType,
@@ -16,13 +18,13 @@ export type NotifyErrorCallback = (error: unknown, message: string, event?: Rela
 export interface RemoteIntercomClient {
   connect(channel: string, pin: string, options?: ConnectOptions): Promise<ConnectResponse>;
   list(): Promise<RelayRequestResponse<ListResponsePayload>>;
-  send(to: string, message: string): RelayEvent<MessagePayload>;
-  ask(to: string, message: string): RelayEvent<MessagePayload>;
-  reply(replyTo: string, message: string): RelayEvent<MessagePayload>;
+  send(to: string, message: string): Promise<RelayRequestResponse<MessageAckPayload>>;
+  ask(to: string, message: string): Promise<RelayRequestResponse<MessageAckPayload>>;
+  reply(replyTo: string, message: string): Promise<RelayRequestResponse<MessageAckPayload>>;
   status(): Promise<RelayRequestResponse<StatusResponsePayload>>;
   disconnect(code?: number, reason?: string): void;
-  approveJoin(joinRequestId: string): RelayEvent;
-  denyJoin(joinRequestId: string): RelayEvent;
+  approveJoin(joinRequestId: string): Promise<RelayRequestResponse<JoinDecisionAckPayload>>;
+  denyJoin(joinRequestId: string): Promise<RelayRequestResponse<JoinDecisionAckPayload>>;
   on(eventType: string, handler: (event: RelayEvent) => void): () => void;
   readonly connectState?: RelayClientState;
   readonly currentStatus?: string;
@@ -64,7 +66,15 @@ export type RemoteIntercomToolResult =
   | { ok: true; action: "connect"; response: ConnectResponse; connection: RelayClientState }
   | { ok: true; action: "list"; event: RelayEvent; responseEvent: RelayEvent<ListResponsePayload>; ownerId: string; members: ListMember[]; connection: RelayClientState }
   | { ok: true; action: "status"; event: RelayEvent; responseEvent: RelayEvent<StatusResponsePayload>; status: StatusResponsePayload; connection: RelayClientState }
-  | { ok: true; action: "send" | "ask" | "reply" | "approve_join" | "deny_join"; event: RelayEvent; connection: RelayClientState }
+  | {
+      ok: true;
+      action: "send" | "ask" | "reply" | "approve_join" | "deny_join";
+      event: RelayEvent;
+      requestEvent: RelayEvent;
+      responseEvent: RelayEvent<MessageAckPayload | JoinDecisionAckPayload>;
+      payload: MessageAckPayload | JoinDecisionAckPayload;
+      connection: RelayClientState;
+    }
   | { ok: true; action: "pending"; pending: PendingSnapshot }
   | { ok: true; action: "disconnect"; connection: RelayClientState };
 
@@ -135,18 +145,46 @@ export function createRemoteIntercomTool(options: CreateRemoteIntercomToolOption
           connection: connectionState(context.client),
         };
       }
-      case "send":
-        return { ok: true, action: "send", event: context.client.send(input.to, input.message), connection: connectionState(context.client) };
-      case "ask":
-        return { ok: true, action: "ask", event: context.client.ask(input.to, input.message), connection: connectionState(context.client) };
+      case "send": {
+        const response = await context.client.send(input.to, input.message);
+        return {
+          ok: true,
+          action: "send",
+          event: response.requestEvent,
+          requestEvent: response.requestEvent,
+          responseEvent: response.responseEvent,
+          payload: response.payload,
+          connection: connectionState(context.client),
+        };
+      }
+      case "ask": {
+        const response = await context.client.ask(input.to, input.message);
+        return {
+          ok: true,
+          action: "ask",
+          event: response.requestEvent,
+          requestEvent: response.requestEvent,
+          responseEvent: response.responseEvent,
+          payload: response.payload,
+          connection: connectionState(context.client),
+        };
+      }
       case "reply": {
         const replyTo = nonEmpty(input.replyTo) ?? nonEmpty(input.id);
         if (replyTo === undefined) {
           throw new Error("reply requires replyTo or id");
         }
-        const event = context.client.reply(replyTo, input.message);
+        const response = await context.client.reply(replyTo, input.message);
         context.pending.deleteAsk(replyTo);
-        return { ok: true, action: "reply", event, connection: connectionState(context.client) };
+        return {
+          ok: true,
+          action: "reply",
+          event: response.requestEvent,
+          requestEvent: response.requestEvent,
+          responseEvent: response.responseEvent,
+          payload: response.payload,
+          connection: connectionState(context.client),
+        };
       }
       case "pending":
         return { ok: true, action: "pending", pending: context.pending.snapshot() };
@@ -167,15 +205,31 @@ export function createRemoteIntercomTool(options: CreateRemoteIntercomToolOption
         return { ok: true, action: "disconnect", connection: connectionState(context.client) };
       case "approve_join": {
         const joinRequestId = requireJoinRequestId(input);
-        const event = context.client.approveJoin(joinRequestId);
+        const response = await context.client.approveJoin(joinRequestId);
         context.pending.deleteJoinRequest(joinRequestId);
-        return { ok: true, action: "approve_join", event, connection: connectionState(context.client) };
+        return {
+          ok: true,
+          action: "approve_join",
+          event: response.requestEvent,
+          requestEvent: response.requestEvent,
+          responseEvent: response.responseEvent,
+          payload: response.payload,
+          connection: connectionState(context.client),
+        };
       }
       case "deny_join": {
         const joinRequestId = requireJoinRequestId(input);
-        const event = context.client.denyJoin(joinRequestId);
+        const response = await context.client.denyJoin(joinRequestId);
         context.pending.deleteJoinRequest(joinRequestId);
-        return { ok: true, action: "deny_join", event, connection: connectionState(context.client) };
+        return {
+          ok: true,
+          action: "deny_join",
+          event: response.requestEvent,
+          requestEvent: response.requestEvent,
+          responseEvent: response.responseEvent,
+          payload: response.payload,
+          connection: connectionState(context.client),
+        };
       }
       default:
         return assertNever(input);
