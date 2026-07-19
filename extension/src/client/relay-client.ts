@@ -15,6 +15,8 @@ import {
 import { type RelayClientConfig, normalizeConfig } from "../state/config.js";
 
 const WEBSOCKET_OPEN = 1;
+const HEARTBEAT_INTERVAL_MS = 25_000;
+const HEARTBEAT_TIMEOUT_MS = 5_000;
 
 type WebSocketEventType = "open" | "message" | "close" | "error";
 type WebSocketEventHandler = (...args: unknown[]) => void;
@@ -108,6 +110,10 @@ export class RelayClient {
   private socketCleanup?: () => void;
   private pendingOpenReject?: (error: RelayClientError) => void;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private reconnectPromise?: Promise<void>;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private healthCheckPromise?: Promise<void>;
+  private lastInboundAt = 0;
   private reconnectAttempt = 0;
   private explicitDisconnect = false;
   private lastConnectArgs?: { channel: string; pin: string; options: ConnectOptions };
@@ -241,19 +247,19 @@ export class RelayClient {
   }
 
   send(to: string, message: string, timeoutMs = 10_000): Promise<RelayRequestResponse<MessageAckPayload>> {
-    return this.requestResponse<MessageAckPayload>({
+    return this.afterHealthy(() => this.requestResponse<MessageAckPayload>({
       type: RelayEventType.MessageSend,
       to,
       payload: { text: message, kind: "send" },
-    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown");
+    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown"));
   }
 
   ask(to: string, message: string, timeoutMs = 10_000): Promise<RelayRequestResponse<MessageAckPayload>> {
-    return this.requestResponse<MessageAckPayload>({
+    return this.afterHealthy(() => this.requestResponse<MessageAckPayload>({
       type: RelayEventType.MessageAsk,
       to,
       payload: { text: message, kind: "ask" },
-    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown");
+    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown"));
   }
 
   reply(replyTo: string, message: string, timeoutMs = 10_000): Promise<RelayRequestResponse<MessageAckPayload>> {
@@ -261,26 +267,26 @@ export class RelayClient {
     if (to === undefined) {
       return Promise.reject(new RelayClientError(`no reply target recorded for ${replyTo}`));
     }
-    return this.requestResponse<MessageAckPayload>({
+    return this.afterHealthy(() => this.requestResponse<MessageAckPayload>({
       type: RelayEventType.MessageReply,
       to,
       replyTo,
       payload: { text: message, kind: "reply" },
-    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown");
+    }, RelayEventType.MessageAck, timeoutMs, "delivery_unknown"));
   }
 
   approve(joinRequestId: string, timeoutMs = 10_000): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
-    return this.requestResponse<JoinDecisionAckPayload>({
+    return this.afterHealthy(() => this.requestResponse<JoinDecisionAckPayload>({
       type: RelayEventType.JoinApprove,
       payload: { joinRequestId },
-    }, RelayEventType.JoinDecisionAck, timeoutMs, "decision_unknown");
+    }, RelayEventType.JoinDecisionAck, timeoutMs, "decision_unknown"));
   }
 
   deny(joinRequestId: string, timeoutMs = 10_000): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
-    return this.requestResponse<JoinDecisionAckPayload>({
+    return this.afterHealthy(() => this.requestResponse<JoinDecisionAckPayload>({
       type: RelayEventType.JoinDeny,
       payload: { joinRequestId },
-    }, RelayEventType.JoinDecisionAck, timeoutMs, "decision_unknown");
+    }, RelayEventType.JoinDecisionAck, timeoutMs, "decision_unknown"));
   }
 
   approveJoin(joinRequestId: string, timeoutMs = 10_000): Promise<RelayRequestResponse<JoinDecisionAckPayload>> {
@@ -291,12 +297,24 @@ export class RelayClient {
     return this.deny(joinRequestId, timeoutMs);
   }
 
-  async list(timeoutMs = 5_000): Promise<RelayRequestResponse<ListResponsePayload>> {
-    return this.requestResponse<ListResponsePayload>({ type: RelayEventType.ListRequest }, RelayEventType.ListResponse, timeoutMs);
+  list(timeoutMs = 5_000): Promise<RelayRequestResponse<ListResponsePayload>> {
+    return this.afterHealthy(() => this.requestResponse<ListResponsePayload>(
+      { type: RelayEventType.ListRequest },
+      RelayEventType.ListResponse,
+      timeoutMs,
+    ));
   }
 
-  async status(timeoutMs = 5_000): Promise<RelayRequestResponse<StatusResponsePayload>> {
-    return this.requestResponse<StatusResponsePayload>({ type: RelayEventType.StatusRequest }, RelayEventType.StatusResponse, timeoutMs);
+  status(timeoutMs = 5_000): Promise<RelayRequestResponse<StatusResponsePayload>> {
+    return this.afterHealthy(() => this.requestStatus(timeoutMs));
+  }
+
+  private requestStatus(timeoutMs: number): Promise<RelayRequestResponse<StatusResponsePayload>> {
+    return this.requestResponse<StatusResponsePayload>(
+      { type: RelayEventType.StatusRequest },
+      RelayEventType.StatusResponse,
+      timeoutMs,
+    );
   }
 
   requestResponse<TPayload extends Record<string, unknown>>(
@@ -387,6 +405,8 @@ export class RelayClient {
         if (this.pendingOpenReject === rejectBeforeOpen) {
           this.pendingOpenReject = undefined;
         }
+        this.lastInboundAt = Date.now();
+        this.startHeartbeat();
         resolve();
       };
       const messageHandler = (first: unknown): void => {
@@ -416,6 +436,7 @@ export class RelayClient {
           status: this.state.status,
         });
         this.socket = undefined;
+        this.stopHeartbeat();
         cleanup();
         if (willReconnect) {
           this.scheduleReconnect();
@@ -447,6 +468,7 @@ export class RelayClient {
   }
 
   private closeCurrentSocket(code?: number, reason?: string, suppressReconnect = false): void {
+    this.stopHeartbeat();
     const socket = this.socket;
     if (socket !== undefined && suppressReconnect) {
       this.suppressReconnectForSocket.add(socket);
@@ -462,7 +484,12 @@ export class RelayClient {
     }
     for (const [id, waiter] of this.responseWaiters) {
       clearTimeout(waiter.timer);
-      waiter.reject(new RelayClientError("relay WebSocket connection was closed before response"));
+      waiter.reject(new RelayClientError(
+        "relay WebSocket connection was closed before response",
+        undefined,
+        { requestId: id, responseType: waiter.responseType },
+        waiter.timeoutCode,
+      ));
       this.responseWaiters.delete(id);
     }
     socket?.close?.(code, reason);
@@ -491,27 +518,109 @@ export class RelayClient {
     });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      void this.reconnect();
+      void this.reconnect().catch(() => undefined);
     }, delay);
   }
 
-  private async reconnect(): Promise<void> {
+  private reconnect(): Promise<void> {
+    if (this.reconnectPromise !== undefined) {
+      return this.reconnectPromise;
+    }
     const args = this.lastConnectArgs;
     if (this.explicitDisconnect || args === undefined) {
-      return;
+      return Promise.resolve();
     }
-    try {
-      await this.connect(args.channel, args.pin, args.options);
-    } catch (error) {
-      if (!this.explicitDisconnect) {
-        this.emitError("reconnect_failed", error);
-        this.scheduleReconnect();
+
+    const reconnectPromise = (async (): Promise<void> => {
+      this.emitError("reconnect_attempt", `reconnecting to relay`, {
+        attempt: Math.max(this.reconnectAttempt, 1),
+        deviceId: this.state.deviceId,
+        channelId: this.state.channelId,
+        status: this.state.status,
+      });
+      try {
+        await this.connect(args.channel, args.pin, args.options);
+        this.emitError("reconnect_success", `reconnected to relay`, {
+          deviceId: this.state.deviceId,
+          channelId: this.state.channelId,
+          status: this.state.status,
+        });
+      } catch (error) {
+        if (!this.explicitDisconnect) {
+          this.emitError("reconnect_failed", error);
+          this.scheduleReconnect();
+        }
+        throw error;
       }
+    })();
+    this.reconnectPromise = reconnectPromise;
+    void reconnectPromise.finally(() => {
+      if (this.reconnectPromise === reconnectPromise) {
+        this.reconnectPromise = undefined;
+      }
+    }).catch(() => undefined);
+    return reconnectPromise;
+  }
+
+  private afterHealthy<T>(operation: () => Promise<T>): Promise<T> {
+    const healthCheck = this.ensureHealthy();
+    return healthCheck === undefined ? operation() : healthCheck.then(operation);
+  }
+
+  private ensureHealthy(): Promise<void> | undefined {
+    if (this.healthCheckPromise !== undefined) {
+      return this.healthCheckPromise;
+    }
+    const socket = this.socket;
+    const stale = Date.now() - this.lastInboundAt >= HEARTBEAT_INTERVAL_MS;
+    if (socket?.readyState === WEBSOCKET_OPEN && !stale) {
+      return undefined;
+    }
+
+    const healthCheckPromise = (async (): Promise<void> => {
+      if (socket?.readyState === WEBSOCKET_OPEN) {
+        try {
+          await this.requestStatus(HEARTBEAT_TIMEOUT_MS);
+          return;
+        } catch (error) {
+          if (this.explicitDisconnect) {
+            throw error;
+          }
+          this.emitError("heartbeat_timeout", error, {
+            deviceId: this.state.deviceId,
+            channelId: this.state.channelId,
+            status: this.state.status,
+          });
+        }
+      }
+      await this.reconnect();
+    })();
+    this.healthCheckPromise = healthCheckPromise;
+    void healthCheckPromise.finally(() => {
+      if (this.healthCheckPromise === healthCheckPromise) {
+        this.healthCheckPromise = undefined;
+      }
+    }).catch(() => undefined);
+    return healthCheckPromise;
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      void this.ensureHealthy()?.catch(() => undefined);
+    }, HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== undefined) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
     }
   }
 
   private isEstablishedMemberConnection(): boolean {
-    return this.state.status === "created" || this.state.status === "connected";
+    return this.state.status === "created" || this.state.status === "connected" || this.state.status === "pending_approval";
   }
 
   private handleSocketMessage(rawData: unknown): void {
@@ -530,6 +639,7 @@ export class RelayClient {
     if (typeof event.type !== "string") {
       return;
     }
+    this.lastInboundAt = Date.now();
     this.applyStateEvent(event);
     this.resolveResponseWaiter(event);
     if (event.id !== undefined && event.from !== undefined && event.from !== this.state.deviceId) {

@@ -611,6 +611,69 @@ describe("RelayClient", () => {
     }
   });
 
+  it("reconnects a pending half-open socket after heartbeat timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const diagnostics: string[] = [];
+      const client = new RelayClient(
+        { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+        { fetch: mockFetch(connectPayload({ status: "pending_approval", joinRequestId: "join_1" })), WebSocket: MockWebSocket },
+      );
+      client.on(RelayEventType.Error, (event) => diagnostics.push(String(event.payload?.code)));
+      await connectAndOpen(client);
+      const original = MockWebSocket.instances[0];
+
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(JSON.parse(original?.sent.at(-1) ?? "{}")).toEqual(expect.objectContaining({ type: RelayEventType.StatusRequest }));
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushPromises();
+
+      expect(MockWebSocket.instances).toHaveLength(2);
+      const replacement = MockWebSocket.instances[1];
+      replacement?.emitOpen();
+      await flushPromises();
+
+      expect(client.currentStatus).toBe("pending_approval");
+      expect(diagnostics).toEqual(expect.arrayContaining(["heartbeat_timeout", "reconnect_attempt", "reconnect_success"]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shares one stale preflight reconnect across concurrent operations", async () => {
+    vi.useFakeTimers();
+    try {
+      let sequence = 0;
+      const client = new RelayClient(
+        { relayHttpUrl: "http://relay.example", deviceName: "test-device" },
+        { fetch: mockFetch(connectPayload()), WebSocket: MockWebSocket, idGenerator: () => `evt_${++sequence}` },
+      );
+      await connectAndOpen(client);
+
+      await vi.advanceTimersByTimeAsync(25_000);
+      const sendPromise = client.send("dev_2", "hello");
+      const askPromise = client.ask("dev_2", "question?");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushPromises();
+
+      expect(MockWebSocket.instances).toHaveLength(2);
+      const replacement = MockWebSocket.instances[1];
+      replacement?.emitOpen();
+      await flushPromises();
+      const outbound = (replacement?.sent ?? []).map((raw) => JSON.parse(raw) as RelayEvent);
+      const send = outbound.find((event) => event.type === RelayEventType.MessageSend);
+      const ask = outbound.find((event) => event.type === RelayEventType.MessageAsk);
+      expect(send?.id).toBeDefined();
+      expect(ask?.id).toBeDefined();
+      replacement?.emitMessage({ type: "message.ack", replyTo: send?.id, payload: { status: "delivered", deviceId: "dev_2" } });
+      replacement?.emitMessage({ type: "message.ack", replyTo: ask?.id, payload: { status: "delivered", deviceId: "dev_2" } });
+      await Promise.all([sendPromise, askPromise]);
+      expect(MockWebSocket.instances).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reconnects an established member socket after close", async () => {
     vi.useFakeTimers();
     let connectCount = 0;
