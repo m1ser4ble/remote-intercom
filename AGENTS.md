@@ -9,8 +9,9 @@ Use these sources in order:
 1. `AGENTS.md` — repository-wide invariants and workflow.
 2. `docs/decisions/` — accepted architectural decisions and their rationale.
 3. `docs/specs/` — change-specific behavior and acceptance criteria.
-4. `protocol/wire.md` — normative wire protocol.
-5. Source and tests — implementation and executable evidence.
+4. `tasks/` — approved active implementation plan and execution checklist.
+5. `protocol/wire.md` — normative wire protocol.
+6. Source and tests — implementation and executable evidence.
 
 If two sources conflict, stop and resolve the higher-level document before changing code.
 
